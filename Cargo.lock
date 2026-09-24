@@ -698,7 +698,6 @@ dependencies = [
  "instability",
  "lazy_static",
  "linkme",
- "once_cell",
  "procfs",
  "ratatui",
  "regex",
