@@ -210,7 +210,10 @@ impl Instance {
     #[tracing::instrument(skip(self), fields(id = %self.id))]
     pub async fn refresh_state(&self) -> bool {
         match self.client.get_thread_pool_snapshot().await {
-            Ok(snapshot) => self.apply_thread_pool_snapshot(snapshot).await,
+            Ok(snapshot) => {
+                self.apply_thread_pool_snapshot(snapshot).await;
+                true
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "controller",
@@ -224,21 +227,12 @@ impl Instance {
     }
 
     /// Apply one successful thread-pool snapshot to this instance.
-    async fn apply_thread_pool_snapshot(&self, snapshot: ThreadPoolSnapshot) -> bool {
-        let cpu = if snapshot.per_thread_util.is_none() {
-            match read_cpu_sample(self.pid, &self.thread_name_filter) {
-                Ok(sample) => Some(sample),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "controller",
-                        %error,
-                        "failed to sample backend task CPU"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
+    async fn apply_thread_pool_snapshot(&self, snapshot: ThreadPoolSnapshot) {
+        let utilisation = match snapshot.per_thread_util {
+            Some(util) => Utilisation::Backend(util.clamp(0.0, 1.0)),
+            None => self
+                .sample_procfs_cpu()
+                .map_or(Utilisation::Unavailable, Utilisation::Procfs),
         };
         let now = Instant::now();
         let mut status = self.status.write().await;
@@ -253,49 +247,52 @@ impl Instance {
         status.vcpu_count = snapshot.vcpu_count;
         status.perf = snapshot.perf;
         status.alive = true;
-        let backend_util = snapshot.per_thread_util.map(|util| util.clamp(0.0, 1.0));
-        if let Some(backend_util) = backend_util {
-            status.per_worker_util.clear();
-            status.last_worker_names = None;
-            status.per_thread_util = backend_util;
-        } else if let (Some(previous), Some(current)) =
-            (status.last_cpu_sample.as_ref(), cpu.as_ref())
-        {
-            let wall_ticks = current
-                .sampled_at
-                .checked_duration_since(previous.sampled_at)
-                .map(|elapsed| elapsed.as_secs_f64() * *TICKS_PER_SECOND)
-                .filter(|ticks| *ticks > 0.0);
-            if let Some(wall_ticks) = wall_ticks {
-                let worker_util =
-                    compute_per_worker_util(&previous.per_worker, &current.per_worker, wall_ticks);
-                update_worker_utilisation(&mut status, worker_util);
+
+        let io_ops_total = snapshot.perf.map_or(0, |perf| perf.total_io_count());
+        match utilisation {
+            Utilisation::Backend(util) => {
+                status.per_worker_util.clear();
+                status.last_worker_names = None;
+                status.per_thread_util = util;
+                status.rolling.push_from_backend_util(
+                    now,
+                    io_ops_total,
+                    util,
+                    snapshot.thread_count,
+                );
+                status.last_cpu_sample = None;
             }
+            Utilisation::Procfs(current) => {
+                if let Some(worker_util) = status
+                    .last_cpu_sample
+                    .as_ref()
+                    .and_then(|previous| procfs_worker_util(previous, &current))
+                {
+                    update_worker_utilisation(&mut status, worker_util);
+                }
+                status.rolling.push_from_procfs_delta(
+                    now,
+                    io_ops_total,
+                    current.cpu_ticks,
+                    *TICKS_PER_SECOND,
+                );
+                status.last_cpu_sample = Some(current);
+            }
+            Utilisation::Unavailable => status.last_cpu_sample = None,
         }
-        let io_ops_total = match snapshot.perf {
-            Some(perf) => perf
-                .read_io_count
-                .saturating_add(perf.write_io_count)
-                .saturating_add(perf.other_io_count),
-            None => 0,
-        };
-        if let Some(per_thread_util) = backend_util {
-            status.rolling.push_from_backend_util(
-                now,
-                io_ops_total,
-                per_thread_util,
-                snapshot.thread_count,
-            );
-        } else if let Some(current) = cpu.as_ref() {
-            status.rolling.push_from_procfs_delta(
-                now,
-                io_ops_total,
-                current.cpu_ticks,
-                *TICKS_PER_SECOND,
-            );
-        }
-        status.last_cpu_sample = if backend_util.is_none() { cpu } else { None };
-        true
+    }
+
+    /// Sample the backend's task CPU counters from `/proc`, logging failures.
+    fn sample_procfs_cpu(&self) -> Option<CpuSample> {
+        read_cpu_sample(self.pid, &self.thread_name_filter)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    target: "controller",
+                    %error,
+                    "failed to sample backend task CPU"
+                );
+            })
+            .ok()
     }
 
     /// Refresh per-tick rates from cumulative backend counters.
@@ -521,6 +518,30 @@ pub struct ThreadPoolSnapshot {
     pub per_thread_util: Option<f64>,
 }
 
+/// Source of one snapshot's CPU utilisation.
+enum Utilisation {
+    /// Average per-thread utilisation computed by the backend.
+    Backend(f64),
+    /// Cumulative task counters sampled from `/proc`.
+    Procfs(CpuSample),
+    /// Neither the backend nor `/proc` produced a sample.
+    Unavailable,
+}
+
+/// Per-worker utilisation between two `/proc` samples, if time has passed.
+fn procfs_worker_util(previous: &CpuSample, current: &CpuSample) -> Option<Vec<(String, f64)>> {
+    let wall_ticks = current
+        .sampled_at
+        .checked_duration_since(previous.sampled_at)
+        .map(|elapsed| elapsed.as_secs_f64() * *TICKS_PER_SECOND)
+        .filter(|ticks| *ticks > 0.0)?;
+    Some(compute_per_worker_util(
+        &previous.per_worker,
+        &current.per_worker,
+        wall_ticks,
+    ))
+}
+
 /// Store one set of per-worker utilisation samples.
 fn update_worker_utilisation(status: &mut InstanceStatus, worker_util: Vec<(String, f64)>) {
     let mut names = worker_util
@@ -573,10 +594,7 @@ fn compute_per_worker_util(
 
 /// Read cumulative CPU time across matching `/proc/<pid>/task/*/stat` files.
 #[tracing::instrument(skip(filter), fields(pid))]
-fn read_cpu_sample(
-    pid: i32,
-    filter: &crate::instance::ThreadNameFilter,
-) -> Result<CpuSample, CpuSampleError> {
+fn read_cpu_sample(pid: i32, filter: &ThreadNameFilter) -> Result<CpuSample, CpuSampleError> {
     let process = Process::new(pid)?;
     let tasks = process.tasks()?;
     let mut cpu_ticks = 0u64;
