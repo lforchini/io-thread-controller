@@ -114,9 +114,9 @@ impl VmStateStore {
     /// Atomically replace the complete ownership registry.
     pub fn save(&self, state: &VmOwnership) -> Result<(), StateError> {
         state.validate()?;
-        let path = Path::new(".");
-        let parent = self.path.parent().unwrap_or_else(|| &path);
-        std::fs::create_dir_all(parent)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let tmp = self
             .path
             .with_extension(format!("json.tmp-{}", std::process::id()));
