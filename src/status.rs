@@ -5,21 +5,13 @@
 
 //! Uptime-style per-VM and aggregate status log lines.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     config::Config,
     instance::{Instance, InstanceStatus},
-    rolling::format_1_5_15,
+    rolling::{WINDOWS, format_1_5_15, format_cells},
 };
-
-/// Construct a [`Duration`] from whole minutes.
-const fn from_mins(minutes: u64) -> Duration {
-    Duration::from_secs(minutes * 60)
-}
-
-/// Rolling windows displayed in uptime-style status fields.
-const STATUS_WINDOWS: [Duration; 3] = [from_mins(1), from_mins(5), from_mins(15)];
 
 /// Emit a one-time legend describing the status-line fields.
 pub(crate) fn emit_legend() {
@@ -45,7 +37,7 @@ pub(crate) async fn emit_status_lines(cfg: &Config, instances: &HashMap<String, 
     fleet.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     for instance in fleet {
         let status = instance.status.read().await;
-        let iops_windows = STATUS_WINDOWS.map(|window| status.rolling.iops_over(window));
+        let iops_windows = WINDOWS.map(|window| status.rolling.iops_over(window));
         for (index, value) in iops_windows.iter().enumerate() {
             if let Some(value) = value {
                 aggregate_iops[index] = aggregate_iops[index].saturating_add(*value);
@@ -65,7 +57,7 @@ pub(crate) async fn emit_status_lines(cfg: &Config, instances: &HashMap<String, 
             target: "status",
             tracked = instances.len(),
             total_threads,
-            iops_1_5_15m = %format_optional_cells(aggregate),
+            iops_1_5_15m = %format_cells(aggregate),
             "aggregate"
         );
     }
@@ -88,7 +80,7 @@ fn emit_instance_status(
             status.rates.write_iops,
             status.rates.other_iops
         ),
-        iops_1_5_15m = %format_optional_cells(iops_windows),
+        iops_1_5_15m = %format_cells(iops_windows),
         bw_mb_s = %format!(
             "{}/{}",
             status.rates.read_bytes_per_second / 1_000_000,
@@ -101,17 +93,4 @@ fn emit_instance_status(
             }),
         ""
     );
-}
-
-/// Render the 1m/5m/15m cells, using `-` before a window has data.
-fn format_optional_cells(values: [Option<u64>; 3]) -> String {
-    values
-        .into_iter()
-        .map(|value| {
-            value
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
