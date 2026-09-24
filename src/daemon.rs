@@ -12,11 +12,6 @@ use inotify::{Inotify, WatchMask};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
 
-pub const VERSION: &str = match option_env!("IO_THREAD_CONTROLLER_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-
 use crate::{
     backends::Backend,
     config::Config,
@@ -26,6 +21,13 @@ use crate::{
     instance::Instance,
     status,
     util::Path,
+};
+
+/// Controller version: `IO_THREAD_CONTROLLER_VERSION` at build time, else
+/// the crate version.
+pub const VERSION: &str = match option_env!("IO_THREAD_CONTROLLER_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
 };
 
 #[derive(Error, Debug)]
@@ -123,7 +125,7 @@ fn setup_inotify(
 ) -> Result<inotify::EventStream<[u8; INOTIFY_EVENT_BUF_SIZE]>, DaemonError> {
     let paths: Vec<Path> = backends
         .iter()
-        .flat_map(|backends| backends.watch_paths())
+        .flat_map(|backend| backend.watch_paths())
         .collect();
     let inotify = Inotify::init()?;
     for path in paths {
