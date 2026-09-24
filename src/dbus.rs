@@ -50,14 +50,14 @@ pub enum DbusRequest {
         /// One-shot channel used to complete the D-Bus method call.
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Compact JSON summary of all tracked VMs.
+    GetStats {
+        /// Reply channel carrying the serialized summary.
+        reply: oneshot::Sender<String>,
+    },
     /// Structured snapshot of every tracked instance. The reply is a JSON
     /// string so the wire signature stays a bare `s` and the payload shape can
     /// evolve without D-Bus IDL churn.  Field contract is documented on
-    /// JSON snapshot of all tracked VMs.
-    GetStats {
-        /// Reply channel carrying the serialized snapshot.
-        reply: oneshot::Sender<String>,
-    },
     /// [`SnapshotPayload`].
     GetSnapshot {
         /// Reply channel; JSON-encoded
@@ -209,6 +209,19 @@ impl Service {
     pub fn new(tx: mpsc::Sender<DbusRequest>) -> Self {
         Self { tx }
     }
+
+    /// Hand one request to the controller and wait for its reply.
+    async fn call<T>(
+        &self,
+        request: impl FnOnce(oneshot::Sender<T>) -> DbusRequest,
+    ) -> zbus::fdo::Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(request(tx))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
+        await_with_timeout(rx).await
+    }
 }
 
 /// Wait for a controller reply while enforcing the D-Bus request timeout.
@@ -224,6 +237,11 @@ async fn await_with_timeout<T>(rx: oneshot::Receiver<T>) -> Result<T, zbus::fdo:
     }
 }
 
+/// Map a controller-side error message to a D-Bus failure.
+fn failed<T>(result: Result<T, String>) -> zbus::fdo::Result<T> {
+    result.map_err(zbus::fdo::Error::Failed)
+}
+
 #[zbus::interface(name = "com.nutanix.io_thread_controller1")]
 impl Service {
     /// Set one VM's worker count through the debug-only control surface.
@@ -234,51 +252,35 @@ impl Service {
         threads: u32,
         sticky: bool,
     ) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::SetThreadCount {
+        failed(
+            self.call(|reply| DbusRequest::SetThreadCount {
                 vm,
                 threads,
                 sticky,
-                reply: tx,
+                reply,
             })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        match await_with_timeout(rx).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
-        }
+            .await?,
+        )
     }
 
-    /// Return the controller's machine-readable fleet snapshot.
+    /// D-Bus wire signature: `GetStats() -> s`.
+    ///
+    /// Returns a compact JSON summary of every tracked VM plus the tick index.
     async fn get_stats(&self) -> zbus::fdo::Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::GetStats { reply: tx })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        await_with_timeout(rx).await
+        self.call(|reply| DbusRequest::GetStats { reply }).await
     }
 
     /// D-Bus wire signature: `GetSnapshot() -> s`.
     ///
-    /// The `s` return is a JSON payload matching
-    /// `SnapshotPayload` on the controller side.  Kept as a
-    /// bare string on the wire so we can evolve the payload
-    /// shape (add a new metric, reorder fields, extend a
-    /// nested block) without a fresh D-Bus signature and
-    /// forced re-flash of every consumer.  Consumers parse it
-    /// with `serde_json` -- unknown fields are ignored, missing
-    /// fields fall back to the type's default -- so slightly
-    /// older consumers keep running against a newer daemon and
-    /// vice versa.
+    /// The `s` return is a JSON payload matching [`SnapshotPayload`]. Kept as
+    /// a bare string on the wire so we can evolve the payload shape (add a
+    /// new metric, reorder fields, extend a nested block) without a fresh
+    /// D-Bus signature and forced re-flash of every consumer.  Consumers
+    /// parse it with `serde_json` -- unknown fields are ignored, missing
+    /// fields fall back to the type's default -- so slightly older consumers
+    /// keep running against a newer daemon and vice versa.
     async fn get_snapshot(&self) -> zbus::fdo::Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::GetSnapshot { reply: tx })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        await_with_timeout(rx).await
+        self.call(|reply| DbusRequest::GetSnapshot { reply }).await
     }
 
     /// D-Bus wire signature: `GetVersion() -> s`.
@@ -287,88 +289,63 @@ impl Service {
     /// logs), exposed separately so high-frequency snapshot payloads stay
     /// focused on dynamic metrics.
     async fn get_version(&self) -> zbus::fdo::Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::GetVersion { reply: tx })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        await_with_timeout(rx).await
+        self.call(|reply| DbusRequest::GetVersion { reply }).await
     }
 
+    /// Return a device's virtqueue-to-IOThread mapping as JSON.
     async fn get_io_thread_vq_mapping(
         &self,
         vm: String,
         device: String,
     ) -> zbus::fdo::Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::GetIoThreadVqMapping {
-                vm,
-                device,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        match await_with_timeout(rx).await? {
-            Ok(v) => Ok(v),
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
-        }
+        failed(
+            self.call(|reply| DbusRequest::GetIoThreadVqMapping { vm, device, reply })
+                .await?,
+        )
     }
 
+    /// Create a named IOThread; a negative `poll_max_ns` keeps the default.
     async fn add_io_thread(
         &self,
         vm: String,
         id: String,
         poll_max_ns: i64,
     ) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::AddIoThread {
+        failed(
+            self.call(|reply| DbusRequest::AddIoThread {
                 vm,
                 id,
                 poll_max_ns,
-                reply: tx,
+                reply,
             })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        match await_with_timeout(rx).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
-        }
+            .await?,
+        )
     }
 
+    /// Delete a named IOThread.
     async fn del_io_thread(&self, vm: String, id: String) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::DelIoThread { vm, id, reply: tx })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        match await_with_timeout(rx).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
-        }
+        failed(
+            self.call(|reply| DbusRequest::DelIoThread { vm, id, reply })
+                .await?,
+        )
     }
 
+    /// Replace a device's virtqueue-to-IOThread mapping from JSON.
     async fn set_io_thread_vq_mapping(
         &self,
         vm: String,
         device: String,
         mapping_json: String,
     ) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(DbusRequest::SetIoThreadVqMapping {
+        failed(
+            self.call(|reply| DbusRequest::SetIoThreadVqMapping {
                 vm,
                 device,
                 mapping_json,
-                reply: tx,
+                reply,
             })
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
-        match await_with_timeout(rx).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
-        }
+            .await?,
+        )
     }
 }
 
