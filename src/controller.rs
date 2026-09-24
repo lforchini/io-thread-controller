@@ -20,6 +20,7 @@ use thiserror::Error;
 use crate::{
     backends::{BackendClientError, IoThreadProperties, VqMapping},
     config::Config,
+    daemon::VERSION,
     dbus::DbusRequest,
     engines::{AppliedOutcome, BlockedReason, EngineTickContext, ScaleAction, ScalingEngine},
     instance::{Instance, InstanceStatus},
@@ -279,7 +280,7 @@ impl Controller {
                 let _ = reply.send(self.handle_get_snapshot().await);
             }
             DbusRequest::GetVersion { reply } => {
-                let _ = reply.send(env!("CARGO_PKG_VERSION").to_string());
+                let _ = reply.send(VERSION.to_string());
             }
             DbusRequest::GetIoThreadVqMapping { vm, device, reply } => {
                 let result = match self.instances.get(&vm) {
@@ -392,7 +393,7 @@ impl Controller {
             .instances
             .get(vm)
             .cloned()
-            .ok_or_else(|| ControllerError::VmError("unknown VM {vm}".to_string()))?;
+            .ok_or_else(|| ControllerError::VmError(format!("unknown VM {vm}")))?;
         let vcpu_count = instance.status.read().await.vcpu_count;
         if threads == 0 {
             return Err(ControllerError::ThreadCountError(
@@ -400,9 +401,9 @@ impl Controller {
             ));
         }
         if threads > vcpu_count {
-            return Err(ControllerError::ThreadCountError(
-                "target thread count {threads} > guest vCPU count {vcpu_count}".to_string(),
-            ));
+            return Err(ControllerError::ThreadCountError(format!(
+                "target thread count {threads} > guest vCPU count {vcpu_count}"
+            )));
         }
 
         instance.client.set_thread_count(threads).await?;
@@ -1159,6 +1160,40 @@ mod tests {
         assert!(controller.instances.is_empty());
         assert_eq!(removed.load(Ordering::Relaxed), 1);
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+    }
+
+    /// Test that manual thread-count errors name the offending VM and
+    /// values.
+    #[tokio::test]
+    async fn set_thread_count_errors_include_context() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            vm_state_path: Path::new(&state_dir.path().join("ownership.json")),
+            ..Default::default()
+        };
+        let mut controller = Controller::new(
+            cfg,
+            Box::new(ThresholdEngine::new(ThresholdConfig::default())),
+        )
+        .unwrap();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let vm = instance("vm-a", 1, closed);
+        vm.status.write().await.vcpu_count = 2;
+        controller.sync_instances(vec![vm]).await.unwrap();
+
+        let error = controller
+            .handle_set_thread_count("vm-missing", 1, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown VM vm-missing"), "{error}");
+
+        let error = controller
+            .handle_set_thread_count("vm-a", 3, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3 > guest vCPU count 2"), "{error}");
     }
 
     /// Test that one tick refreshes state, runs the engine, and drops
