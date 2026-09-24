@@ -112,13 +112,13 @@ impl QemuBackend {
         Ok(Self::new(QemuConfig::from_dir(dir)?))
     }
 
-    async fn get_or_open_conn(&self, uri: &str) -> Option<libvirt::LibvirtConn> {
-        if let Some(c) = self.conn.lock().unwrap().clone()
-            && c.uri == uri
-        {
+    /// Return the cached libvirt connection, dialing it on first use.
+    async fn get_or_open_conn(&self) -> Option<libvirt::LibvirtConn> {
+        if let Some(c) = self.conn.lock().unwrap().clone() {
             return Some(c);
         }
-        match libvirt::LibvirtConn::open(uri.to_string()).await {
+        let uri = &self.cfg.libvirt_uri;
+        match libvirt::LibvirtConn::open(uri.clone()).await {
             Ok(c) => {
                 *self.conn.lock().unwrap() = Some(c.clone());
                 Some(c)
@@ -157,7 +157,7 @@ impl Backend for QemuBackend {
     /// every snapshot so the /proc walker's thread-name filter is
     /// never consulted for this transport.
     async fn discover(&self) -> Vec<Arc<Instance>> {
-        let conn = match self.get_or_open_conn(&self.cfg.libvirt_uri).await {
+        let conn = match self.get_or_open_conn().await {
             Some(c) => c,
             None => return Vec::new(),
         };
