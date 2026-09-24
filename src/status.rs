@@ -84,15 +84,15 @@ fn emit_instance_status(
         thr = status.thread_count,
         iops = %format!(
             "{}/{}/{}",
-            status.read_iops,
-            status.write_iops,
-            status.other_iops
+            status.rates.read_iops,
+            status.rates.write_iops,
+            status.rates.other_iops
         ),
         iops_1_5_15m = %format_optional_cells(iops_windows),
         bw_mb_s = %format!(
             "{}/{}",
-            status.read_bytes_per_second / 1_000_000,
-            status.write_bytes_per_second / 1_000_000
+            status.rates.read_bytes_per_second / 1_000_000,
+            status.rates.write_bytes_per_second / 1_000_000
         ),
         cpu = %format!("{}/{}/{}", cpu.avg_pct, cpu.median_pct, cpu.total_pct),
         cpu_us_per_io_1_5_15m =
