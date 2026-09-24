@@ -199,7 +199,7 @@ pub trait ScalingEngine: Send + Sync {
         // to first look at all the instances first and then make decisions
         join_all(instances.iter().map(|instance| async move {
             let status = instance.status.read().await;
-            if status.manual_scaling_sticky || !status.scaling_allowed {
+            if status.manual_scaling_sticky || !status.scaling_allowed() {
                 return None;
             }
             Some(InstanceDecision::new(
@@ -269,6 +269,77 @@ mod tests {
         let decision = InstanceDecision::new("vm-1", ScaleAction::Up(5));
         assert_eq!(decision.instance_id, "vm-1");
         assert_eq!(decision.decision, ScaleAction::Up(5));
+    }
+
+    struct NoopClient;
+
+    #[async_trait]
+    impl crate::instance::InstanceClient for NoopClient {
+        async fn set_thread_count(&self, _count: u32) -> Result<(), BackendClientError> {
+            Ok(())
+        }
+
+        async fn get_thread_pool_snapshot(
+            &self,
+        ) -> Result<crate::instance::ThreadPoolSnapshot, BackendClientError> {
+            Err(BackendClientError::Transport("unused".into()))
+        }
+
+        async fn close(&self) {}
+    }
+
+    struct ScaleUpEngine;
+
+    #[async_trait]
+    impl ScalingEngine for ScaleUpEngine {
+        fn name(&self) -> &'static str {
+            "scale-up"
+        }
+
+        fn dump_config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn evaluate(
+            &self,
+            _instance: &Arc<Instance>,
+            _context: &EngineTickContext,
+        ) -> ScaleAction {
+            ScaleAction::Up(2)
+        }
+    }
+
+    /// Test that fleet evaluation only plans for managed, non-sticky VMs.
+    #[tokio::test]
+    async fn evaluate_fleet_skips_unmanaged_and_sticky_vms() {
+        let make = |id: &str, classification: Option<bool>, sticky: bool| {
+            let instance = Arc::new(Instance::new(id.to_string(), Path::new(""), 0, NoopClient));
+            let mut status = instance.status.try_write().unwrap();
+            status.ownership_classification = classification;
+            status.manual_scaling_sticky = sticky;
+            drop(status);
+            instance
+        };
+        let fleet = [
+            make("managed", Some(true), false),
+            make("unmanaged", Some(false), false),
+            make("unclassified", None, false),
+            make("sticky", Some(true), true),
+        ];
+        let context = EngineTickContext {
+            now: Instant::now(),
+            min_thread_count: 1,
+            max_thread_count: 8,
+            host_cpu_util: 0.0,
+            tick_index: 0,
+        };
+
+        let plan = ScaleUpEngine.evaluate_fleet(&fleet, &context).await;
+
+        assert_eq!(
+            plan,
+            vec![InstanceDecision::new("managed", ScaleAction::Up(2))]
+        );
     }
 
     /// Test that registry loads the threshold engine by name and errors
