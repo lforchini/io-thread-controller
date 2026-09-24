@@ -24,6 +24,7 @@ use crate::{
     dbus,
     engines::{EngineError, load_registered_engine},
     instance::Instance,
+    status,
     util::Path,
 };
 
@@ -59,17 +60,7 @@ pub async fn run(cfg: Config, backends: Vec<Box<dyn Backend>>) -> Result<(), Dae
         "io-thread-controller starting"
     );
     if cfg.print_status_header {
-        tracing::info!(
-            target: "status",
-            "# vm=<id> thr=<threads> iops=<read>/<write>/<other> \
-             iops_1_5_15m=<1m>/<5m>/<15m> bw_mb_s=<read>/<write> \
-             cpu=<average>/<total> cpu_us_per_io_1_5_15m=<1m>/<5m>/<15m>"
-        );
-        tracing::info!(
-            target: "status",
-            "# aggregate tracked=<instances> threads=<threads> \
-             iops_1_5_15m=<1m>/<5m>/<15m>"
-        );
+        status::emit_legend();
     }
     let engine = load_registered_engine(&cfg.engine_config_dir, &cfg.engine)?;
     let mut controller = Controller::new(cfg.clone(), engine)?;

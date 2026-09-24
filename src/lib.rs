@@ -14,4 +14,5 @@ pub mod engines;
 pub mod instance;
 pub mod rolling;
 pub mod state;
+pub(crate) mod status;
 pub mod util;
