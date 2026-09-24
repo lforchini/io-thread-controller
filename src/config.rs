@@ -123,13 +123,13 @@ impl Default for Config {
             engine_config_dir: Path::new("/etc/io-thread-controller.d/engines"),
             backend_config_dir: Path::new("/etc/io-thread-controller.d/backends"),
             scale_poll_secs: 10.0,
-            min_thread_count: 2,
-            max_thread_count: 8,
-            host_cpu_scale_up_ceiling: 0.9,
-            cooldown_secs: 30.0,
             vm_state_path: Path::new("/run/io-thread-controller/vm-ownership.json"),
-            enable_per_vm_status_line: true,
-            enable_aggregate_status_line: true,
+            min_thread_count: default_min_thread_count(),
+            max_thread_count: default_max_thread_count(),
+            host_cpu_scale_up_ceiling: default_host_cpu_scale_up_ceiling(),
+            cooldown_secs: default_cooldown_secs(),
+            enable_per_vm_status_line: default_true(),
+            enable_aggregate_status_line: default_true(),
             print_status_header: false,
             dry_run: false,
         }
@@ -280,6 +280,25 @@ mod tests {
         assert!(dumped.contains(r#""engine": "threshold""#));
         assert!(dumped.contains(r#""scale_poll_secs": 10.0"#));
         assert!(dumped.contains(r#""/etc/io-thread-controller.d/engines""#));
+    }
+
+    /// Test that `Config::default()` matches what serde produces when
+    /// every optional field is omitted.
+    #[test]
+    fn default_matches_serde_defaults() {
+        let defaults = Config::default();
+        let minimal = serde_json::json!({
+            "engine": defaults.engine,
+            "engine_config_dir": defaults.engine_config_dir,
+            "backend_config_dir": defaults.backend_config_dir,
+            "vm_state_path": defaults.vm_state_path,
+            "scale_poll_secs": defaults.scale_poll_secs,
+        });
+        let loaded: Config = serde_json::from_value(minimal).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&defaults).unwrap()
+        );
     }
 
     /// Test that serde defaults for min/max threads, host CPU ceiling,
