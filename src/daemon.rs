@@ -14,7 +14,7 @@ use tokio::time::{MissedTickBehavior, interval};
 
 pub const VERSION: &str = match option_env!("IO_THREAD_CONTROLLER_VERSION") {
     Some(v) => v,
-    None => "unknown",
+    None => env!("CARGO_PKG_VERSION"),
 };
 
 use crate::{

@@ -35,10 +35,9 @@ enum IoThreadControllerError {
 
 #[derive(Debug, Parser)]
 #[command(
-    // Populated at build time by `build.rs` from the git tree
-    // (short hash, with `-dirty` when the tree had uncommitted
-    // changes).  Falls back to `CARGO_PKG_VERSION` for tarball
-    // builds where `.git` is absent.
+    // Taken from `IO_THREAD_CONTROLLER_VERSION` at build time (e.g.
+    // a git short hash set by packaging), falling back to
+    // `CARGO_PKG_VERSION` when unset.
     version = VERSION,
     name = "io-thread-controller",
     about = "Measure VM I/O workers and resize their pools through a selectable scaling engine."
