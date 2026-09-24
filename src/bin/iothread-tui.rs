@@ -46,8 +46,9 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use tokio::sync::RwLock;
 
-use io_thread_controller::controller::{SnapshotPayload, SnapshotVm};
-use io_thread_controller::dbus::{DBUS_BUS_NAME, DBUS_INTERFACE, DBUS_OBJECT_PATH};
+use io_thread_controller::dbus::{
+    DBUS_BUS_NAME, DBUS_INTERFACE, DBUS_OBJECT_PATH, SnapshotPayload, SnapshotVm,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
