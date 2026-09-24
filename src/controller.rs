@@ -253,12 +253,17 @@ impl Controller {
             .collect();
         let removed = stale.len();
         for id in stale {
-            if let Some(instance) = self.instances.remove(&id) {
-                instance.client.close().await;
-                self.engine.on_instance_removed(&id).await;
-            }
+            self.remove_instance(&id).await;
         }
         Ok((added, removed))
+    }
+
+    /// Stop tracking a VM, closing its client and notifying the engine.
+    async fn remove_instance(&mut self, id: &str) {
+        if let Some(instance) = self.instances.remove(id) {
+            instance.client.close().await;
+            self.engine.on_instance_removed(id).await;
+        }
     }
 
     /// Serve one D-Bus request in-line with the tick loop.
@@ -502,16 +507,10 @@ impl Controller {
         let fleet: Vec<_> = self.instances.values().cloned().collect();
         let refreshes = join_all(fleet.iter().map(|instance| instance.refresh_state())).await;
 
-        for id in fleet
-            .iter()
-            .zip(refreshes)
-            .filter(|(_, refreshed)| !refreshed)
-            .map(|(instance, _)| instance.id.clone())
-        {
-            self.instances.remove(&id);
-            self.engine.on_instance_removed(&id).await;
-            // FIXME IIUC a failed instance gets dropped but we don't call
-            // close()
+        for (instance, refreshed) in fleet.iter().zip(refreshes) {
+            if !refreshed {
+                self.remove_instance(&instance.id).await;
+            }
         }
 
         let fleet: Vec<_> = self.instances.values().cloned().collect();
@@ -1118,7 +1117,9 @@ mod tests {
         }
     }
 
-    struct FailingClient;
+    struct FailingClient {
+        closed: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl InstanceClient for FailingClient {
@@ -1130,7 +1131,9 @@ mod tests {
             Err(BackendClientError::Transport("boom".into()))
         }
 
-        async fn close(&self) {}
+        async fn close(&self) {
+            self.closed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     struct SharedEngine {
@@ -1256,7 +1259,7 @@ mod tests {
     }
 
     /// Test that one tick refreshes state, runs the engine, and drops
-    /// instances that fail refresh.
+    /// and closes instances that fail refresh.
     #[tokio::test]
     async fn tick_refreshes_evaluates_and_drops_failed_instances() {
         let added = Arc::new(AtomicUsize::new(0));
@@ -1283,7 +1286,9 @@ mod tests {
             "bad".to_string(),
             Path::new(""),
             2,
-            FailingClient,
+            FailingClient {
+                closed: Arc::clone(&closed),
+            },
         ));
         controller.sync_instances(vec![ok, bad]).await.unwrap();
         assert_eq!(added.load(Ordering::Relaxed), 2);
@@ -1298,5 +1303,6 @@ mod tests {
         );
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
         assert_eq!(removed.load(Ordering::Relaxed), 1);
+        assert_eq!(closed.load(Ordering::Relaxed), 1);
     }
 }
