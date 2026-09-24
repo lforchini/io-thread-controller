@@ -109,6 +109,33 @@ where
     async fn close(&self) {
         (**self).close().await;
     }
+
+    async fn add_io_thread(
+        &self,
+        id: &str,
+        properties: Option<&IoThreadProperties>,
+    ) -> Result<(), BackendClientError> {
+        (**self).add_io_thread(id, properties).await
+    }
+
+    async fn del_io_thread(&self, id: &str) -> Result<(), BackendClientError> {
+        (**self).del_io_thread(id).await
+    }
+
+    async fn set_io_thread_vq_mapping(
+        &self,
+        device: &str,
+        mapping: &[VqMapping],
+    ) -> Result<(), BackendClientError> {
+        (**self).set_io_thread_vq_mapping(device, mapping).await
+    }
+
+    async fn get_io_thread_vq_mapping(
+        &self,
+        device: &str,
+    ) -> Result<Vec<VqMapping>, BackendClientError> {
+        (**self).get_io_thread_vq_mapping(device).await
+    }
 }
 
 /// One VM tracked by the controller.
@@ -675,6 +702,68 @@ mod tests {
             SnapshotClient { threads: 1 },
         );
         assert_eq!(instance.to_string(), "vm-1");
+    }
+
+    struct IoThreadClient;
+
+    #[async_trait]
+    impl InstanceClient for IoThreadClient {
+        async fn set_thread_count(&self, _count: u32) -> Result<(), BackendClientError> {
+            Ok(())
+        }
+
+        async fn get_thread_pool_snapshot(&self) -> Result<ThreadPoolSnapshot, BackendClientError> {
+            Err(BackendClientError::Transport("unused".into()))
+        }
+
+        async fn close(&self) {}
+
+        async fn add_io_thread(
+            &self,
+            _id: &str,
+            _properties: Option<&IoThreadProperties>,
+        ) -> Result<(), BackendClientError> {
+            Ok(())
+        }
+
+        async fn del_io_thread(&self, _id: &str) -> Result<(), BackendClientError> {
+            Ok(())
+        }
+
+        async fn set_io_thread_vq_mapping(
+            &self,
+            _device: &str,
+            _mapping: &[VqMapping],
+        ) -> Result<(), BackendClientError> {
+            Ok(())
+        }
+
+        async fn get_io_thread_vq_mapping(
+            &self,
+            _device: &str,
+        ) -> Result<Vec<VqMapping>, BackendClientError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Test that a pre-boxed client keeps its IOThread operations when
+    /// wrapped by `Instance::new`.
+    #[tokio::test]
+    async fn boxed_client_forwards_io_thread_operations() {
+        let client: Box<dyn InstanceClient> = Box::new(IoThreadClient);
+        let instance = Instance::new("vm-boxed".to_string(), Path::new(""), 1, client);
+        instance.client.add_io_thread("iot0", None).await.unwrap();
+        instance.client.del_io_thread("iot0").await.unwrap();
+        instance
+            .client
+            .set_io_thread_vq_mapping("dev", &[])
+            .await
+            .unwrap();
+        instance
+            .client
+            .get_io_thread_vq_mapping("dev")
+            .await
+            .unwrap();
     }
 
     use super::{TaskCpuSample, compute_per_worker_util};
