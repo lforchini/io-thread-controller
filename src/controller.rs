@@ -174,6 +174,65 @@ struct HostCpuSample {
     total_ticks: u64,
 }
 
+impl HostCpuSample {
+    /// Read aggregate host CPU counters.
+    fn read() -> Result<Self, ProcError> {
+        let total = procfs::KernelStats::current()?.total;
+        let idle_ticks = total.idle.saturating_add(total.iowait.unwrap_or(0));
+        let total_ticks = total
+            .user
+            .saturating_add(total.nice)
+            .saturating_add(total.system)
+            .saturating_add(total.idle)
+            .saturating_add(total.iowait.unwrap_or(0))
+            .saturating_add(total.irq.unwrap_or(0))
+            .saturating_add(total.softirq.unwrap_or(0))
+            .saturating_add(total.steal.unwrap_or(0))
+            .saturating_add(total.guest.unwrap_or(0))
+            .saturating_add(total.guest_nice.unwrap_or(0));
+        Ok(Self {
+            busy_ticks: total_ticks.saturating_sub(idle_ticks),
+            total_ticks,
+        })
+    }
+
+    /// Fraction of host CPU that was busy between `previous` and `self`.
+    fn utilisation_since(self, previous: Self) -> f64 {
+        let delta_busy = self.busy_ticks.saturating_sub(previous.busy_ticks) as f64;
+        let delta_total = self.total_ticks.saturating_sub(previous.total_ticks) as f64;
+        if delta_total == 0.0 {
+            0.0
+        } else {
+            (delta_busy / delta_total).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Tracks host CPU utilisation across successive ticks.
+#[derive(Debug, Default)]
+struct HostCpuMonitor {
+    /// Previous host CPU sample.
+    last: Option<HostCpuSample>,
+    /// Fraction of host CPU consumed between the last two samples; zero until
+    /// two samples exist.
+    util: f64,
+}
+
+impl HostCpuMonitor {
+    /// Take a new sample and return the latest utilisation.
+    ///
+    /// A failed read keeps the previous value.
+    fn sample(&mut self) -> f64 {
+        if let Ok(current) = HostCpuSample::read() {
+            if let Some(previous) = self.last {
+                self.util = current.utilisation_since(previous);
+            }
+            self.last = Some(current);
+        }
+        self.util
+    }
+}
+
 /// Live VM inventory and per-tick driver.
 pub struct Controller {
     /// Effective daemon configuration.
@@ -196,10 +255,8 @@ pub struct Controller {
     pub instances: HashMap<String, Arc<Instance>>,
     /// Monotonically increasing tick sequence.
     pub tick_index: u64,
-    /// Previous host CPU sample.
-    last_host_cpu: Option<HostCpuSample>,
-    /// Fraction of host CPU consumed since the previous tick.
-    host_cpu_util: f64,
+    /// Host CPU utilisation used by the scale-up ceiling guard.
+    host_cpu: HostCpuMonitor,
 }
 
 impl Controller {
@@ -214,8 +271,7 @@ impl Controller {
             vm_ownership,
             instances: HashMap::new(),
             tick_index: 0,
-            last_host_cpu: None,
-            host_cpu_util: 0.0,
+            host_cpu: HostCpuMonitor::default(),
         })
     }
 
@@ -491,17 +547,12 @@ impl Controller {
     /// Refresh the fleet, evaluate one coherent plan, and apply eligible work.
     pub async fn tick(&mut self) -> Result<(), ControllerError> {
         self.tick_index = self.tick_index.wrapping_add(1);
-        if let Ok(current) = read_host_cpu_sample() {
-            if let Some(previous) = self.last_host_cpu {
-                self.host_cpu_util = host_cpu_utilisation(previous, current);
-            }
-            self.last_host_cpu = Some(current);
-        }
+        let host_cpu_util = self.host_cpu.sample();
         let context = EngineTickContext {
             now: Instant::now(),
             min_thread_count: self.cfg.min_thread_count,
             max_thread_count: self.cfg.max_thread_count,
-            host_cpu_util: self.host_cpu_util,
+            host_cpu_util,
             tick_index: self.tick_index,
         };
         let fleet: Vec<_> = self.instances.values().cloned().collect();
@@ -684,7 +735,7 @@ impl Controller {
         if target > status.thread_count
             && matches!(action, ScaleAction::Up(_))
             && self.cfg.host_cpu_scale_up_ceiling > 0.0
-            && self.host_cpu_util >= self.cfg.host_cpu_scale_up_ceiling
+            && self.host_cpu.util >= self.cfg.host_cpu_scale_up_ceiling
         {
             return Some(BlockedReason::HostCpuCeiling);
         }
@@ -768,38 +819,6 @@ impl Controller {
                 }),
             ""
         );
-    }
-}
-
-/// Read aggregate host CPU counters.
-fn read_host_cpu_sample() -> Result<HostCpuSample, ControllerError> {
-    let total = procfs::KernelStats::current()?.total;
-    let idle_ticks = total.idle.saturating_add(total.iowait.unwrap_or(0));
-    let total_ticks = total
-        .user
-        .saturating_add(total.nice)
-        .saturating_add(total.system)
-        .saturating_add(total.idle)
-        .saturating_add(total.iowait.unwrap_or(0))
-        .saturating_add(total.irq.unwrap_or(0))
-        .saturating_add(total.softirq.unwrap_or(0))
-        .saturating_add(total.steal.unwrap_or(0))
-        .saturating_add(total.guest.unwrap_or(0))
-        .saturating_add(total.guest_nice.unwrap_or(0));
-    Ok(HostCpuSample {
-        busy_ticks: total_ticks.saturating_sub(idle_ticks),
-        total_ticks,
-    })
-}
-
-/// Compute host CPU utilisation from successive cumulative samples.
-fn host_cpu_utilisation(previous: HostCpuSample, current: HostCpuSample) -> f64 {
-    let delta_busy = current.busy_ticks.saturating_sub(previous.busy_ticks) as f64;
-    let delta_total = current.total_ticks.saturating_sub(previous.total_ticks) as f64;
-    if delta_total == 0.0 {
-        0.0
-    } else {
-        (delta_busy / delta_total).clamp(0.0, 1.0)
     }
 }
 
@@ -1079,7 +1098,7 @@ mod tests {
 
         let (_state_dir, mut controller) = guard_controller();
         for (name, tweak, action, host_cpu_util, expected) in cases {
-            controller.host_cpu_util = host_cpu_util;
+            controller.host_cpu.util = host_cpu_util;
             let mut status = guard_status();
             tweak(&mut status);
             let target = action.target().unwrap();
