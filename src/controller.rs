@@ -1120,7 +1120,7 @@ mod tests {
     /// Test that discovery sync adds new VMs, retains existing ones,
     /// and removes disappeared ones.
     #[tokio::test]
-    async fn sync_instances_adds_retains_and_removes() {
+    async fn test_controller_sync_instances_adds_retains_and_removes() {
         let added = Arc::new(AtomicUsize::new(0));
         let removed = Arc::new(AtomicUsize::new(0));
         let evaluated = Arc::new(AtomicUsize::new(0));
@@ -1165,7 +1165,7 @@ mod tests {
     /// Test that one tick refreshes state, runs the engine, and drops
     /// instances that fail refresh.
     #[tokio::test]
-    async fn tick_refreshes_evaluates_and_drops_failed_instances() {
+    async fn test_controller_tick_refreshes_evaluates_and_drops_failed_instances() {
         let added = Arc::new(AtomicUsize::new(0));
         let removed = Arc::new(AtomicUsize::new(0));
         let evaluated = Arc::new(AtomicUsize::new(0));
