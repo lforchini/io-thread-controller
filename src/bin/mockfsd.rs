@@ -543,6 +543,8 @@ fn io_error(err: std::io::Error) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(err.to_string())
 }
 
+// TOOD: add a call to register a socket at a path to allow other processes
+// to drive the file in a callback manner
 #[zbus::interface(name = "com.nutanix.mockfs1")]
 impl Control {
     async fn mount(&self, mount_path: String) -> zbus::fdo::Result<()> {
