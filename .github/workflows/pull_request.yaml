@@ -25,5 +25,5 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.toolchain }}-
-      - run: sudo apt-get install libvirt-dev
+      - run: sudo apt-get install libvirt-dev fuse3
       - run: make pre-push
