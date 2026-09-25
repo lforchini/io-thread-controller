@@ -488,12 +488,11 @@ mod tests {
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
-        time::{Duration, Instant},
+        time::Instant,
     };
 
     use async_trait::async_trait;
-    use rstest::{fixture, rstest};
-    use test_log::test;
+    use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
     use super::{ThresholdConfig, ThresholdEngine, log_performance_revert};
     use crate::{
@@ -539,7 +538,6 @@ mod tests {
         async fn close(&self) {}
     }
 
-    #[fixture]
     async fn instance() -> Arc<Instance> {
         let instance = Arc::new(Instance::new(
             "vm-1".to_string(),
@@ -552,22 +550,6 @@ mod tests {
         status.perf = Some(InstancePerfSample::default());
         drop(status);
         instance
-    }
-
-    impl Default for EngineTickContext {
-        fn default() -> Self {
-            Self {
-                now: Instant::now() + Duration::from_secs(1),
-                min_thread_count: 2,
-                max_thread_count: 8,
-                host_cpu_util: 0.0,
-                tick_index: 0,
-            }
-        }
-    }
-
-    fn context() -> EngineTickContext {
-        EngineTickContext::default()
     }
 
     async fn set_observation(
@@ -609,160 +591,112 @@ mod tests {
         assert!(rendered.contains("thr=6->5"));
     }
 
-    #[fixture]
-    fn engine() -> ThresholdEngine {
-        ThresholdEngine::new(ThresholdConfig {
-            scale_up_threshold: 0.8,
-            scale_up_min_gain: 0.05,
-            scale_validation_sample_polls: 0,
-            ..Default::default()
-        })
+    fn nearly_eq(left: f64, right: f64) -> bool {
+        (left - right).abs() <= 1e-6 * (1.0 + left.abs().max(right.abs()))
     }
 
-    /// Test that an IOPS-rate drop after scale-up triggers revert.
-    #[rstest]
-    #[tokio::test]
-    async fn scale_up_revert_fires_on_iops_rate_drop(
-        engine: ThresholdEngine,
-        #[future] instance: Arc<Instance>,
-    ) {
-        let instance = instance.await;
-        engine.on_instance_added(&instance).await;
-        engine
-            .on_applied(
-                &instance.id,
-                AppliedOutcome::Success {
-                    action: ScaleAction::Up(6),
-                    prev_thread_count: 5,
-                    prev_io_count_total: 155_000,
-                },
-            )
-            .await;
-        set_observation(&instance, 6, 0.6, 122_000).await;
-
-        assert_eq!(
-            engine.evaluate(&instance, &context()).await,
-            ScaleAction::Revert(5)
-        );
-    }
-
-    /// Test that flat post-scale IOPS/rate during validation triggers
-    /// revert.
-    #[rstest]
-    #[tokio::test]
-    async fn scale_up_flat_rate_reverts(
-        engine: ThresholdEngine,
-        #[future] instance: Arc<Instance>,
-    ) {
-        let instance = instance.await;
-        engine.on_instance_added(&instance).await;
-        engine
-            .on_applied(
-                &instance.id,
-                AppliedOutcome::Success {
-                    action: ScaleAction::Up(4),
-                    prev_thread_count: 3,
-                    prev_io_count_total: 100_000,
-                },
-            )
-            .await;
-        set_observation(&instance, 4, 0.6, 101_000).await;
-
-        assert_eq!(
-            engine.evaluate(&instance, &context()).await,
-            ScaleAction::Revert(3)
-        );
-    }
-
-    /// Test that percent fields serde as human percents on the wire and
-    /// fractions in memory.
+    /// Test that an unknown percent key is rejected.
     #[test]
-    fn percent_wire_format_round_trips() {
-        let config: ThresholdConfig =
-            serde_json::from_str(r#"{"scale_up_min_gain_percent":10}"#).unwrap();
-        assert!((config.scale_up_min_gain - 0.10).abs() < f64::EPSILON);
-
-        let serialized = serde_json::to_string(&config).unwrap();
-        assert!(serialized.contains(r#""scale_up_min_gain_percent":10.0"#));
+    fn percent_wire_format_rejects_unknown_field() {
         assert!(
             serde_json::from_str::<ThresholdConfig>(r#"{"scale_up_revert_drop_percent":10}"#)
                 .is_err()
         );
     }
 
-    // Test that right after a scale up operation the engine does not ask for
-    // another scale up during the validation period.
-    /// Test that while a prior scale-up is pending validation, further
-    /// scale-ups are suppressed.
-    #[rstest]
-    #[test(tokio::test)]
-    async fn no_scale_up_during_pending_validation(
-        engine: ThresholdEngine,
-        #[future] instance: Arc<Instance>,
-    ) {
-        let instance = instance.await;
+    proptest! {
+        #[test]
+        fn percent_fields_round_trip_on_the_wire(
+            threshold in 0.0..=100.0f64,
+            min_gain in 0.0..=100.0f64,
+            revert_drop in 0.0..=100.0f64,
+        ) {
+            let input = serde_json::json!({
+                "scale_up_threshold_percent": threshold,
+                "scale_up_min_gain_percent": min_gain,
+                "scale_down_revert_drop_percent": revert_drop,
+            });
+            let config: ThresholdConfig = serde_json::from_str(&input.to_string()).unwrap();
+            prop_assert!(nearly_eq(config.scale_up_threshold, threshold / 100.0));
+            prop_assert!(nearly_eq(config.scale_up_min_gain, min_gain / 100.0));
+            prop_assert!(nearly_eq(config.scale_down_revert_drop, revert_drop / 100.0));
 
-        // inform the engine of the scale up
-        engine.on_instance_added(&instance).await;
-        engine
-            .on_applied(
-                &instance.id,
-                AppliedOutcome::Success {
-                    action: ScaleAction::Up(5),
-                    prev_thread_count: 4,
-                    prev_io_count_total: 149_000,
-                },
-            )
-            .await;
-
-        set_observation(&instance, 5, 0.88, 160_000).await;
-
-        for _ in 0..engine.cfg.scale_validation_sample_polls {
-            // there should be no scale up during the validation period
-            assert_eq!(
-                engine.evaluate(&instance, &context()).await,
-                ScaleAction::None
-            );
+            let serialized: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            prop_assert!(nearly_eq(
+                serialized["scale_up_threshold_percent"].as_f64().unwrap(),
+                threshold
+            ));
+            prop_assert!(nearly_eq(
+                serialized["scale_up_min_gain_percent"].as_f64().unwrap(),
+                min_gain
+            ));
+            prop_assert!(nearly_eq(
+                serialized["scale_down_revert_drop_percent"].as_f64().unwrap(),
+                revert_drop
+            ));
         }
-
-        // after the validation period the engine is allowed to scale up
-        assert_eq!(
-            engine.evaluate(&instance, &context()).await,
-            ScaleAction::Up(6)
-        );
     }
 
-    /// Test that a scale up is revert after the validation period if
-    /// performance doesn't increase much.
-    #[rstest]
-    #[test(tokio::test)]
-    async fn pending_validation_reverts_regressive_scale(
-        engine: ThresholdEngine,
-        #[future] instance: Arc<Instance>,
-    ) {
-        let instance = instance.await;
-        engine.on_instance_added(&instance).await;
-        engine
-            .on_applied(
-                &instance.id,
-                AppliedOutcome::Success {
-                    action: ScaleAction::Up(5),
-                    prev_thread_count: 4,
-                    prev_io_count_total: 149_000,
-                },
-            )
-            .await;
-        set_observation(&instance, 5, 0.88, 140_000).await;
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        #[test]
+        fn scale_up_validation_holds_then_reverts_or_scales(
+            polls in 1u32..6,
+            thread_count in 1u32..6,
+            previous_threads in 1u32..8,
+            gain in 0.01f64..=1.0,
+            baseline in 0u64..500_000,
+            observed in 0u64..1_000_000,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let engine = ThresholdEngine::new(ThresholdConfig {
+                    scale_up_threshold: 0.5,
+                    scale_up_min_gain: gain,
+                    scale_validation_sample_polls: polls,
+                    ..ThresholdConfig::default()
+                });
+                let instance = instance().await;
+                let context = EngineTickContext {
+                    now: Instant::now(),
+                    min_thread_count: 1,
+                    max_thread_count: thread_count + 1,
+                    host_cpu_util: 0.0,
+                    tick_index: 0,
+                };
+                engine.on_instance_added(&instance).await;
+                engine
+                    .on_applied(
+                        &instance.id,
+                        AppliedOutcome::Success {
+                            action: ScaleAction::Up(thread_count),
+                            prev_thread_count: previous_threads,
+                            prev_io_count_total: baseline,
+                        },
+                    )
+                    .await;
+                set_observation(&instance, thread_count, 0.95, observed).await;
 
-        for _ in 0..engine.cfg.scale_validation_sample_polls {
-            assert_eq!(
-                engine.evaluate(&instance, &context()).await,
-                ScaleAction::None
-            );
+                for _ in 0..polls {
+                    prop_assert_eq!(
+                        engine.evaluate(&instance, &context).await,
+                        ScaleAction::None
+                    );
+                }
+
+                let action = engine.evaluate(&instance, &context).await;
+                let required = baseline as f64 * (1.0 + gain);
+                if baseline > 0 && (observed as f64) < required {
+                    prop_assert_eq!(action, ScaleAction::Revert(previous_threads));
+                } else {
+                    prop_assert_eq!(action, ScaleAction::Up(thread_count + 1));
+                }
+                Ok(())
+            })?;
         }
-        assert_eq!(
-            engine.evaluate(&instance, &context()).await,
-            ScaleAction::Revert(4)
-        );
     }
 }
