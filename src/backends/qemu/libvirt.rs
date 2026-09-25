@@ -441,7 +441,31 @@ fn parse_qmp_envelope(cmd: &str, body: &str) -> Result<Box<RawValue>, QemuError>
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i32>().prop_map(serde_json::Value::from),
+            "[a-z0-9 ]{0,12}".prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(2, 8, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map("[a-z]{1,6}", inner, 0..3)
+                    .prop_map(|map| { serde_json::Value::Object(map.into_iter().collect()) }),
+            ]
+        })
+        // Option<RawValue> decodes a JSON null return as a missing payload.
+        .prop_filter("null return is absent", |value| !value.is_null())
+    }
+
+    fn arb_blockstat() -> impl Strategy<Value = [Option<u64>; 6]> {
+        prop::array::uniform6(prop::option::of(any::<u64>()))
+    }
 
     /// Test that domain XML detection accepts virtio-scsi model
     /// variants and rejects others.
@@ -457,63 +481,92 @@ mod tests {
         assert!(!xml_has_virtio_scsi(d));
     }
 
-    /// Test that a QMP success envelope yields the return payload.
-    #[test]
-    fn parse_envelope_extracts_return() {
-        let body = r#"{"return":{"foo":42}}"#;
-        let v = parse_qmp_envelope("query", body).unwrap();
-        assert_eq!(v.get(), r#"{"foo":42}"#);
-    }
-
-    /// Test that a QMP error envelope becomes a typed error with
-    /// class/desc.
-    #[test]
-    fn parse_envelope_surfaces_qmp_error() {
-        let body = r#"{"error":{"class":"GenericError","desc":"boom"}}"#;
-        let err = parse_qmp_envelope("query", body).unwrap_err();
-        match err {
-            QemuError::QmpError { class, desc, .. } => {
-                assert_eq!(class, "GenericError");
-                assert_eq!(desc, "boom");
+    proptest! {
+        #[test]
+        fn qmp_error_envelope_preserves_class_and_desc(
+            cmd in "[a-z-]{1,16}",
+            class in "[a-zA-Z0-9 .,_-]{0,32}",
+            desc in "[a-zA-Z0-9 .,_-]{0,32}",
+        ) {
+            let body = serde_json::json!({
+                "error": {"class": class, "desc": desc}
+            })
+            .to_string();
+            match parse_qmp_envelope(&cmd, &body).unwrap_err() {
+                QemuError::QmpError {
+                    cmd: got_cmd,
+                    class: got_class,
+                    desc: got_desc,
+                } => {
+                    prop_assert_eq!(got_cmd, cmd);
+                    prop_assert_eq!(got_class, class);
+                    prop_assert_eq!(got_desc, desc);
+                }
+                other => panic!("unexpected err: {other:?}"),
             }
-            other => panic!("unexpected err: {other:?}"),
         }
-    }
 
-    /// Test that blockstats counters are summed across disks.
-    #[test]
-    fn parse_blockstats_sums_across_devices() {
-        let body = r#"[
-            {"stats": {
-                "rd_operations": 100,
-                "wr_operations": 200,
-                "flush_operations": 3,
-                "unmap_operations": 1,
-                "rd_bytes": 4096,
-                "wr_bytes": 8192
-            }},
-            {"stats": {
-                "rd_operations": 50,
-                "wr_operations": 25,
-                "flush_operations": 0,
-                "unmap_operations": 0,
-                "rd_bytes": 2048,
-                "wr_bytes": 1024
-            }}
-        ]"#;
-        let p = parse_blockstats(body).unwrap().unwrap();
-        assert_eq!(p.read_io_count, 150);
-        assert_eq!(p.write_io_count, 225);
-        assert_eq!(p.other_io_count, 4);
-        assert_eq!(p.read_bytes_total, 6144);
-        assert_eq!(p.write_bytes_total, 9216);
-        assert_eq!(p.total_io_count(), 150 + 225 + 4);
-    }
+        #[test]
+        fn qmp_return_envelope_yields_the_payload_unchanged(payload in arb_json()) {
+            let payload = serde_json::to_string(&payload).unwrap();
+            let body = format!(r#"{{"return":{payload}}}"#);
+            let parsed = parse_qmp_envelope("query", &body).unwrap();
+            prop_assert_eq!(parsed.get(), payload);
+        }
 
-    /// Test that empty blockstats parses as unavailable/`None`.
-    #[test]
-    fn parse_blockstats_empty_returns_unavailable() {
-        let p = parse_blockstats("[]").unwrap();
-        assert!(p.is_none());
+        #[test]
+        fn blockstats_sum_with_saturating_arithmetic(
+            entries in prop::collection::vec(arb_blockstat(), 0..6),
+        ) {
+            prop_assert!(parse_blockstats("[]").unwrap().is_none());
+            if entries.is_empty() {
+                return Ok(());
+            }
+
+            let mut read_io = 0u64;
+            let mut write_io = 0u64;
+            let mut other_io = 0u64;
+            let mut read_bytes = 0u64;
+            let mut write_bytes = 0u64;
+            let mut body = Vec::new();
+            for entry in &entries {
+                let rd_bytes = entry[0].unwrap_or(0);
+                let wr_bytes = entry[1].unwrap_or(0);
+                let rd_operations = entry[2].unwrap_or(0);
+                let wr_operations = entry[3].unwrap_or(0);
+                let flush_operations = entry[4].unwrap_or(0);
+                let unmap_operations = entry[5].unwrap_or(0);
+                read_bytes = read_bytes.saturating_add(rd_bytes);
+                write_bytes = write_bytes.saturating_add(wr_bytes);
+                read_io = read_io.saturating_add(rd_operations);
+                write_io = write_io.saturating_add(wr_operations);
+                other_io =
+                    other_io.saturating_add(flush_operations.saturating_add(unmap_operations));
+
+                let mut stats = serde_json::Map::new();
+                for (key, value) in [
+                    ("rd_bytes", entry[0]),
+                    ("wr_bytes", entry[1]),
+                    ("rd_operations", entry[2]),
+                    ("wr_operations", entry[3]),
+                    ("flush_operations", entry[4]),
+                    ("unmap_operations", entry[5]),
+                ] {
+                    if let Some(value) = value {
+                        stats.insert(key.to_string(), serde_json::json!(value));
+                    }
+                }
+                body.push(serde_json::json!({"stats": stats}));
+            }
+
+            let parsed = parse_blockstats(&serde_json::to_string(&body).unwrap())
+                .unwrap()
+                .unwrap();
+            prop_assert_eq!(parsed.read_io_count, read_io);
+            prop_assert_eq!(parsed.write_io_count, write_io);
+            prop_assert_eq!(parsed.other_io_count, other_io);
+            prop_assert_eq!(parsed.read_bytes_total, read_bytes);
+            prop_assert_eq!(parsed.write_bytes_total, write_bytes);
+        }
     }
 }

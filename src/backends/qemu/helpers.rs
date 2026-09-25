@@ -285,45 +285,99 @@ pub fn next_qemu_iothread_id(existing: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
-    /// Test that vQ round-robin mapping spreads queues across IOThreads
-    /// as evenly as possible.
-    #[test]
-    fn round_robin_distributes_evenly() {
-        let ids = vec!["iot0".to_string(), "iot1".to_string(), "iot2".to_string()];
-        let mapping = round_robin_vq_mapping(&ids, 7);
-        let counts: Vec<usize> = mapping.iter().map(|m| m.vqs.len()).collect();
-        assert_eq!(counts, vec![3, 2, 2]);
-        assert_eq!(mapping[0].vqs, vec![0, 3, 6]);
-        assert_eq!(mapping[1].vqs, vec![1, 4]);
-        assert_eq!(mapping[2].vqs, vec![2, 5]);
-    }
+    proptest! {
+        #[test]
+        fn round_robin_partitions_queues(
+            ids in prop::collection::vec("[a-z]{1,4}", 0..8),
+            vq_count in 0u16..128,
+        ) {
+            let mapping = round_robin_vq_mapping(&ids, vq_count);
+            if ids.is_empty() || vq_count == 0 {
+                prop_assert!(mapping.is_empty());
+                return Ok(());
+            }
 
-    /// Test that `next_qemu_iothread_id` fills the lowest missing
-    /// `iotN` id.
-    #[test]
-    fn next_id_fills_gaps_in_order() {
-        let ids = vec!["iot0".to_string(), "iot2".to_string()];
-        assert_eq!(next_qemu_iothread_id(&ids), "iot1");
-        let ids = vec!["iot0".to_string(), "iot1".to_string()];
-        assert_eq!(next_qemu_iothread_id(&ids), "iot2");
-    }
+            prop_assert_eq!(mapping.len(), ids.len());
+            let mut seen = vec![false; usize::from(vq_count)];
+            for (idx, entry) in mapping.iter().enumerate() {
+                prop_assert_eq!(&entry.iothread, &ids[idx]);
+                for &vq in &entry.vqs {
+                    prop_assert_eq!(usize::from(vq) % ids.len(), idx);
+                    prop_assert!(!seen[usize::from(vq)]);
+                    seen[usize::from(vq)] = true;
+                }
+            }
+            prop_assert!(seen.into_iter().all(|present| present));
+            let sizes: Vec<usize> = mapping.iter().map(|entry| entry.vqs.len()).collect();
+            let min = sizes.iter().copied().min().unwrap();
+            let max = sizes.iter().copied().max().unwrap();
+            prop_assert!(max - min <= 1);
+        }
 
-    /// Test that prometheus scrape text yields IOThread ids, TIDs, and
-    /// the virtio-scsi device path.
-    #[test]
-    fn topology_parses_prometheus_body() {
-        let body = r#"# HELP foo
-qemu_iothread_info{id="iot0",tid="123"} 1
-qemu_iothread_info{id="iot1",tid="124"} 1
-qemu_iothread_info{id="dirtybitmap",tid="999"} 1
-qemu_virtio_scsi_num_queues{device="/machine/peripheral/scsi0"} 4
-"#;
-        let topo = QemuTopology::new(body);
-        assert_eq!(topo.iothreads, vec!["iot0", "iot1"]);
-        assert_eq!(topo.iothread_tids.get("iot0"), Some(&123));
-        assert_eq!(topo.device_path, "/machine/peripheral/scsi0");
-        assert_eq!(topo.vq_count, 4);
+        #[test]
+        fn next_id_is_the_lowest_missing_iot(
+            present in prop::collection::btree_set(0u32..1024, 0..32),
+        ) {
+            let ids: Vec<String> = present.iter().map(|n| format!("iot{n}")).collect();
+            let expected = (0..1024).find(|n| !present.contains(n)).unwrap();
+            prop_assert_eq!(next_qemu_iothread_id(&ids), format!("iot{expected}"));
+        }
+
+        #[test]
+        fn topology_keeps_managed_threads_and_the_first_device(
+            threads in prop::collection::vec(
+                (0u32..20, any::<i32>(), prop::bool::ANY),
+                0..8,
+            ),
+            unmanaged in prop::collection::vec("[a-z]{1,6}", 0..4),
+            devices in prop::collection::vec(
+                (prop::bool::ANY, "[a-z]{1,8}", 0u16..64),
+                0..4,
+            ),
+        ) {
+            let mut body = String::from("# HELP comment\nnot a metric\n");
+            body.push_str("qemu_virtio_scsi_num_queues{device=\"\"} 3\n");
+            body.push_str("qemu_iothread_info{id=\"iot7\",tid=\"nope\"} 1\n");
+
+            let mut expected_tids = BTreeMap::new();
+            for (n, tid, use_thread_id) in &threads {
+                let id = format!("iot{n}");
+                let label = if *use_thread_id { "thread_id" } else { "tid" };
+                body.push_str(&format!(
+                    "qemu_iothread_info{{id=\"{id}\",{label}=\"{tid}\"}} 1\n"
+                ));
+                expected_tids.insert(id, *tid);
+            }
+            for name in &unmanaged {
+                body.push_str(&format!("qemu_iothread_info{{id=\"{name}\",tid=\"1\"}} 1\n"));
+            }
+
+            let mut expected_device = String::new();
+            let mut expected_vqs = 0u16;
+            for (use_path_label, path, vqs) in &devices {
+                let label = if *use_path_label { "path" } else { "device" };
+                body.push_str(&format!(
+                    "qemu_virtio_scsi_num_queues{{{label}=\"{path}\"}} {vqs}\n"
+                ));
+                if expected_device.is_empty() {
+                    expected_device = path.clone();
+                    expected_vqs = *vqs;
+                }
+            }
+            if !expected_device.is_empty() {
+                body.push_str("qemu_virtio_scsi_num_queues{device=\"later\"} 99\n");
+            }
+
+            let topo = QemuTopology::new(&body);
+            let expected_ids: Vec<String> = expected_tids.keys().cloned().collect();
+            prop_assert_eq!(topo.iothreads, expected_ids);
+            prop_assert_eq!(topo.iothread_tids, expected_tids);
+            prop_assert_eq!(topo.device_path, expected_device);
+            prop_assert_eq!(topo.vq_count, expected_vqs);
+        }
     }
 }

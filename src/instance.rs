@@ -665,38 +665,54 @@ mod tests {
         assert!(closed.load(Ordering::Relaxed));
     }
 
-    use super::{TaskCpuSample, compute_per_worker_util};
+    use std::collections::HashMap;
 
-    fn task(tid: i32, name: &str, cpu_ticks: u64) -> TaskCpuSample {
-        TaskCpuSample {
-            tid,
-            name: name.to_string(),
-            cpu_ticks,
+    use proptest::prelude::*;
+
+    use super::compute_per_worker_util;
+
+    fn arb_tasks() -> impl Strategy<Value = Vec<TaskCpuSample>> {
+        prop::collection::vec((any::<i32>(), "[a-z]{1,8}", any::<u64>()), 0..8).prop_map(|rows| {
+            rows.into_iter()
+                .map(|(tid, name, cpu_ticks)| TaskCpuSample {
+                    tid,
+                    name,
+                    cpu_ticks,
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn per_worker_util_follows_matching_tid_and_name(
+            previous in arb_tasks(),
+            current in arb_tasks(),
+            wall_ticks in 0.001f64..10_000.0,
+        ) {
+            let mut baseline: HashMap<i32, (String, u64)> = HashMap::new();
+            for task in &previous {
+                baseline.insert(task.tid, (task.name.clone(), task.cpu_ticks));
+            }
+            let expected: Vec<(String, f64)> = current
+                .iter()
+                .filter_map(|task| {
+                    let (name, previous_ticks) = baseline.get(&task.tid)?;
+                    if name != &task.name {
+                        return None;
+                    }
+                    let delta = task.cpu_ticks.checked_sub(*previous_ticks)?;
+                    Some((
+                        task.name.clone(),
+                        (delta as f64 / wall_ticks).clamp(0.0, 1.0),
+                    ))
+                })
+                .collect();
+
+            prop_assert_eq!(
+                compute_per_worker_util(&previous, &current, wall_ticks),
+                expected
+            );
         }
-    }
-
-    /// Test that two workers sharing a name still get independent
-    /// CPU-delta util samples.
-    #[test]
-    fn duplicate_worker_names_keep_independent_deltas() {
-        let previous = vec![task(10, "worker", 100), task(11, "worker", 200)];
-        let current = vec![task(11, "worker", 400), task(10, "worker", 200)];
-
-        let util = compute_per_worker_util(&previous, &current, 500.0);
-        assert_eq!(util.len(), 2);
-        assert!((util[0].1 - 0.4).abs() < f64::EPSILON);
-        assert!((util[1].1 - 0.2).abs() < f64::EPSILON);
-    }
-
-    /// Test that a newly appeared worker does not spike util from
-    /// lifetime counters.
-    #[test]
-    fn new_worker_starts_without_a_lifetime_spike() {
-        let previous = vec![task(10, "worker0", 100)];
-        let current = vec![task(10, "worker0", 200), task(11, "worker1", 900_000)];
-
-        let util = compute_per_worker_util(&previous, &current, 500.0);
-        assert_eq!(util.len(), 1);
-        assert!((util[0].1 - 0.2).abs() < f64::EPSILON);
     }
 }
