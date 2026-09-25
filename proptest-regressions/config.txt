@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 24f59b9f64e9c8a187130d7ed2058581bd29209230655817d50c1aac20ce2d11 # shrinks to engine = "", engine_config_dir = "a", backend_config_dir = "0", vm_state_path = "a", min_thread_count = 0, max_thread_count = 0, host_cpu_scale_up_ceiling = 0.0, cooldown_secs = 0.0, scale_poll_secs = -189.52469654897686, enable_per_vm_status_line = false, enable_aggregate_status_line = false, print_status_header = false, dry_run = false
