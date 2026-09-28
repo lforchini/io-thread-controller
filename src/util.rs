@@ -13,10 +13,10 @@ use std::{
     fmt::{self, Debug},
     ops::Deref,
     str::FromStr,
+    sync::LazyLock,
 };
 
 use glob;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone)]
@@ -69,11 +69,11 @@ impl fmt::Display for Path {
     }
 }
 
-lazy_static! {
-    static ref IO_THREAD_CONTROLLER_ROOT_PATH: std::path::PathBuf = std::path::PathBuf::from(
-        env::var("IO_THREAD_CONTROLLER_ROOT_PATH").unwrap_or(String::from("/"))
-    );
-}
+static IO_THREAD_CONTROLLER_ROOT_PATH: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+    std::path::PathBuf::from(
+        env::var("IO_THREAD_CONTROLLER_ROOT_PATH").unwrap_or(String::from("/")),
+    )
+});
 
 impl Path {
     pub fn new<S>(s: &S) -> Self
@@ -127,9 +127,8 @@ impl FromStr for Path {
 #[macro_export]
 macro_rules! path {
     ( $x: ident, $p: expr) => {
-        lazy_static! {
-            pub static ref $x: $crate::conf::Path = $crate::conf::Path::new($p);
-        }
+        pub static $x: std::sync::LazyLock<$crate::util::Path> =
+            std::sync::LazyLock::new(|| $crate::util::Path::new($p));
         impl AsRef<std::path::Path> for $x {
             fn as_ref(&self) -> &std::path::Path {
                 &self
