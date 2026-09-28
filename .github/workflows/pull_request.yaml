@@ -16,5 +16,14 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: "rustfmt,clippy"
+      - uses: actions/cache@v6
+        id: cache-target-restore
+        with:
+          path: |
+            ~/.cargo
+            ./target
+          key: ${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.toolchain }}-
       - run: sudo apt-get install libvirt-dev
       - run: make pre-push
