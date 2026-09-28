@@ -17,11 +17,13 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io,
     ops::Sub,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
-use once_cell::sync::Lazy;
 use procfs::process::Process;
 use regex::Regex;
 use rustix::param;
@@ -68,11 +70,12 @@ impl From<QemuError> for BackendClientError {
 // Topology parser
 // ---------------------------------------------------------------------
 
-static IOTHREAD_INFO_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^qemu_iothread_info\{([^}]*)\}\s+([0-9.eE+\-]+)").unwrap());
-static MANAGED_IOT_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^iot[0-9]+$").unwrap());
-static VIRTIO_SCSI_NUM_QUEUES_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^qemu_virtio_scsi_num_queues\{([^}]*)\}\s+([0-9.eE+\-]+)").unwrap());
+static IOTHREAD_INFO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^qemu_iothread_info\{([^}]*)\}\s+([0-9.eE+\-]+)").unwrap());
+static MANAGED_IOT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^iot[0-9]+$").unwrap());
+static VIRTIO_SCSI_NUM_QUEUES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^qemu_virtio_scsi_num_queues\{([^}]*)\}\s+([0-9.eE+\-]+)").unwrap()
+});
 
 /// IOThread and virtio-scsi topology parsed from QEMU metrics.
 #[derive(Debug, Default, Clone)]
