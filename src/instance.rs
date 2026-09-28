@@ -139,7 +139,7 @@ enum CpuSampleError {
     Proc(#[from] procfs::ProcError),
 }
 /// The constant tick rate used for process stats from /proc.
-static TICKS_PER_SECOND: LazyLock<f64> = LazyLock::new(|| procfs::ticks_per_second() as f64);
+pub static TICKS_PER_SECOND: LazyLock<f64> = LazyLock::new(|| procfs::ticks_per_second() as f64);
 
 impl Instance {
     /// Construct a VM record with an empty initial status.
@@ -255,12 +255,9 @@ impl Instance {
                 snapshot.thread_count,
             );
         } else if let Some(current) = cpu.as_ref() {
-            status.rolling.push_from_procfs_delta(
-                now,
-                io_ops_total,
-                current.cpu_ticks,
-                *TICKS_PER_SECOND,
-            );
+            status
+                .rolling
+                .push_from_procfs_delta(now, io_ops_total, current.cpu_ticks);
         }
         status.last_cpu_sample = if backend_util.is_none() { cpu } else { None };
         true

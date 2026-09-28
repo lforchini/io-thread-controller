@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::instance::TICKS_PER_SECOND;
+
 /// Longest retained status window.
 const MAX_WINDOW: Duration = Duration::from_secs(15 * 60);
 
@@ -47,7 +49,6 @@ impl RollingMetrics {
         now: Instant,
         io_ops_cumulative: u64,
         cpu_ticks_cumulative: u64,
-        clock_ticks_per_second: f64,
     ) {
         let Some(previous_wall_ts) = self.previous_wall_ts else {
             self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
@@ -63,17 +64,13 @@ impl RollingMetrics {
             self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
             return;
         };
-        if io_ops_cumulative < previous_io_ops
-            || cpu_ticks_cumulative < previous_cpu_ticks
-            || clock_ticks_per_second <= 0.0
-        {
+        if io_ops_cumulative < previous_io_ops || cpu_ticks_cumulative < previous_cpu_ticks {
             self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
             return;
         }
 
         let cpu_tick_delta = cpu_ticks_cumulative - previous_cpu_ticks;
-        let cpu_ns_delta =
-            (cpu_tick_delta as f64 * 1_000_000_000.0 / clock_ticks_per_second) as u64;
+        let cpu_ns_delta = (cpu_tick_delta as f64 * 1_000_000_000.0 / *TICKS_PER_SECOND) as u64;
         self.samples.push_back(TickSample {
             wall_ts: now,
             io_ops_delta: io_ops_cumulative - previous_io_ops,
@@ -244,7 +241,7 @@ mod tests {
     fn first_sample_only_establishes_baseline() {
         let mut metrics = RollingMetrics::new();
         let t0 = Instant::now();
-        metrics.push_from_procfs_delta(t0, 10, 20, 100.0);
+        metrics.push_from_procfs_delta(t0, 10, 20);
         assert!(metrics.is_empty());
     }
 
@@ -254,8 +251,8 @@ mod tests {
     fn rates_use_real_elapsed_time() {
         let mut metrics = RollingMetrics::new();
         let t0 = Instant::now();
-        metrics.push_from_procfs_delta(t0, 10, 20, 100.0);
-        metrics.push_from_procfs_delta(t0 + Duration::from_secs(2), 210, 120, 100.0);
+        metrics.push_from_procfs_delta(t0, 10, 20);
+        metrics.push_from_procfs_delta(t0 + Duration::from_secs(2), 210, 120);
         assert_eq!(metrics.iops_over(Duration::from_secs(60)), Some(100));
         assert_eq!(
             metrics.cpu_us_per_io_over(Duration::from_secs(60)),
@@ -269,8 +266,8 @@ mod tests {
     fn counter_reset_replaces_baseline() {
         let mut metrics = RollingMetrics::new();
         let t0 = Instant::now();
-        metrics.push_from_procfs_delta(t0, 100, 100, 100.0);
-        metrics.push_from_procfs_delta(t0 + Duration::from_secs(1), 10, 10, 100.0);
+        metrics.push_from_procfs_delta(t0, 100, 100);
+        metrics.push_from_procfs_delta(t0 + Duration::from_secs(1), 10, 10);
         assert!(metrics.is_empty());
     }
 }
