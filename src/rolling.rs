@@ -16,8 +16,7 @@ const MAX_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Delta recorded for one successful sampling interval.
 #[derive(Debug, Clone, Copy)]
 struct TickSample {
-    // FIXME wall_ts variable should be renamed to sampled_at
-    wall_ts: Instant,
+    sampled_at: Instant,
     io_ops_delta: u64,
     cpu_ns_delta: u64,
     wall_dt_ns: u64,
@@ -49,39 +48,27 @@ impl RollingMetrics {
         cpu_ticks_cumulative: u64,
         clock_ticks_per_second: f64,
     ) {
-        let Some(previous_wall_ts) = self.previous_wall_ts else {
-            self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
-            return;
-        };
-        let (Some(previous_io_ops), Some(previous_cpu_ticks)) =
-            (self.previous_io_ops, self.previous_cpu_ticks)
-        else {
-            self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
-            return;
-        };
-        let Some(elapsed) = now.checked_duration_since(previous_wall_ts) else {
-            self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
-            return;
-        };
-        if io_ops_cumulative < previous_io_ops
-            || cpu_ticks_cumulative < previous_cpu_ticks
-            || clock_ticks_per_second <= 0.0
+        if let (Some(elapsed), Some(previous_io_ops), Some(previous_cpu_ticks)) = (
+            self.elapsed_since_previous(now),
+            self.previous_io_ops,
+            self.previous_cpu_ticks,
+        ) && io_ops_cumulative >= previous_io_ops
+            && cpu_ticks_cumulative >= previous_cpu_ticks
+            && clock_ticks_per_second > 0.0
         {
-            self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
-            return;
+            let cpu_tick_delta = cpu_ticks_cumulative - previous_cpu_ticks;
+            let cpu_ns_delta =
+                (cpu_tick_delta as f64 * 1_000_000_000.0 / clock_ticks_per_second) as u64;
+            self.push_sample(
+                now,
+                elapsed,
+                io_ops_cumulative - previous_io_ops,
+                cpu_ns_delta,
+            );
         }
-
-        let cpu_tick_delta = cpu_ticks_cumulative - previous_cpu_ticks;
-        let cpu_ns_delta =
-            (cpu_tick_delta as f64 * 1_000_000_000.0 / clock_ticks_per_second) as u64;
-        self.samples.push_back(TickSample {
-            wall_ts: now,
-            io_ops_delta: io_ops_cumulative - previous_io_ops,
-            cpu_ns_delta,
-            wall_dt_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
-        });
-        self.set_baseline(now, io_ops_cumulative, cpu_ticks_cumulative);
-        self.trim(now);
+        self.previous_wall_ts = Some(now);
+        self.previous_io_ops = Some(io_ops_cumulative);
+        self.previous_cpu_ticks = Some(cpu_ticks_cumulative);
     }
 
     /// Append an interval from backend-computed per-thread utilisation.
@@ -92,53 +79,32 @@ impl RollingMetrics {
         per_thread_util: f64,
         thread_count: u32,
     ) {
-        let (Some(previous_wall_ts), Some(previous_io_ops)) =
-            (self.previous_wall_ts, self.previous_io_ops)
-        else {
-            self.set_backend_baseline(now, io_ops_cumulative);
-            return;
-        };
-        let Some(elapsed) = now.checked_duration_since(previous_wall_ts) else {
-            self.set_backend_baseline(now, io_ops_cumulative);
-            return;
-        };
-        if io_ops_cumulative < previous_io_ops {
-            self.set_backend_baseline(now, io_ops_cumulative);
-            return;
+        if let (Some(elapsed), Some(previous_io_ops)) =
+            (self.elapsed_since_previous(now), self.previous_io_ops)
+            && io_ops_cumulative >= previous_io_ops
+        {
+            let cpu_ns_delta = (saturating_nanos(elapsed) as f64
+                * per_thread_util.clamp(0.0, 1.0)
+                * f64::from(thread_count))
+            .min(u64::MAX as f64) as u64;
+            self.push_sample(
+                now,
+                elapsed,
+                io_ops_cumulative - previous_io_ops,
+                cpu_ns_delta,
+            );
         }
-
-        let wall_dt_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let cpu_ns_delta =
-            (wall_dt_ns as f64 * per_thread_util.clamp(0.0, 1.0) * f64::from(thread_count))
-                .min(u64::MAX as f64) as u64;
-        self.samples.push_back(TickSample {
-            wall_ts: now,
-            io_ops_delta: io_ops_cumulative - previous_io_ops,
-            cpu_ns_delta,
-            wall_dt_ns,
-        });
-        self.set_backend_baseline(now, io_ops_cumulative);
-        self.trim(now);
+        self.previous_wall_ts = Some(now);
+        self.previous_io_ops = Some(io_ops_cumulative);
+        self.previous_cpu_ticks = None;
     }
 
     /// Append an already-computed delta, used by fleet aggregation.
     pub fn push_delta(&mut self, now: Instant, io_ops_delta: u64, cpu_ns_delta: u64) {
-        let Some(previous_wall_ts) = self.previous_wall_ts else {
-            self.previous_wall_ts = Some(now);
-            return;
-        };
-        let Some(elapsed) = now.checked_duration_since(previous_wall_ts) else {
-            self.previous_wall_ts = Some(now);
-            return;
-        };
-        self.samples.push_back(TickSample {
-            wall_ts: now,
-            io_ops_delta,
-            cpu_ns_delta,
-            wall_dt_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
-        });
+        if let Some(elapsed) = self.elapsed_since_previous(now) {
+            self.push_sample(now, elapsed, io_ops_delta, cpu_ns_delta);
+        }
         self.previous_wall_ts = Some(now);
-        self.trim(now);
     }
 
     /// Return the newest I/O and CPU deltas.
@@ -173,16 +139,27 @@ impl RollingMetrics {
         self.samples.is_empty()
     }
 
-    fn set_baseline(&mut self, now: Instant, io_ops: u64, cpu_ticks: u64) {
-        self.previous_wall_ts = Some(now);
-        self.previous_io_ops = Some(io_ops);
-        self.previous_cpu_ticks = Some(cpu_ticks);
+    /// Time since the previous baseline, if one exists and `now` is not
+    /// earlier.
+    fn elapsed_since_previous(&self, now: Instant) -> Option<Duration> {
+        now.checked_duration_since(self.previous_wall_ts?)
     }
 
-    fn set_backend_baseline(&mut self, now: Instant, io_ops: u64) {
-        self.previous_wall_ts = Some(now);
-        self.previous_io_ops = Some(io_ops);
-        self.previous_cpu_ticks = None;
+    /// Record one completed interval ending at `now`.
+    fn push_sample(
+        &mut self,
+        now: Instant,
+        elapsed: Duration,
+        io_ops_delta: u64,
+        cpu_ns_delta: u64,
+    ) {
+        self.samples.push_back(TickSample {
+            sampled_at: now,
+            io_ops_delta,
+            cpu_ns_delta,
+            wall_dt_ns: saturating_nanos(elapsed),
+        });
+        self.trim(now);
     }
 
     fn trim(&mut self, now: Instant) {
@@ -194,14 +171,14 @@ impl RollingMetrics {
         while self
             .samples
             .front()
-            .is_some_and(|sample| sample.wall_ts < cutoff)
+            .is_some_and(|sample| sample.sampled_at < cutoff)
         {
             self.samples.pop_front();
         }
     }
 
     fn totals(&self, window: Duration) -> Option<(u64, u64, u64)> {
-        let newest = self.samples.back()?.wall_ts;
+        let newest = self.samples.back()?.sampled_at;
         // Same as trim: a failed checked_sub means "include all retained samples".
         let cutoff = newest.checked_sub(window);
         let mut io_ops = 0u64;
@@ -210,7 +187,7 @@ impl RollingMetrics {
         for sample in self
             .samples
             .iter()
-            .filter(|sample| cutoff.is_none_or(|cutoff| sample.wall_ts >= cutoff))
+            .filter(|sample| cutoff.is_none_or(|cutoff| sample.sampled_at >= cutoff))
         {
             io_ops = io_ops.saturating_add(sample.io_ops_delta);
             cpu_ns = cpu_ns.saturating_add(sample.cpu_ns_delta);
@@ -218,6 +195,11 @@ impl RollingMetrics {
         }
         Some((io_ops, cpu_ns, wall_ns))
     }
+}
+
+/// Convert a duration to nanoseconds, saturating at `u64::MAX`.
+fn saturating_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 /// Render 1m/5m/15m cells, using `-` until a window has a sample.
@@ -260,6 +242,21 @@ mod tests {
         assert_eq!(
             metrics.cpu_us_per_io_over(Duration::from_secs(60)),
             Some(5_000)
+        );
+    }
+
+    /// Test that backend-reported utilisation converts to CPU time over
+    /// the elapsed interval.
+    #[test]
+    fn backend_util_derives_cpu_time_from_elapsed_interval() {
+        let mut metrics = RollingMetrics::new();
+        let t0 = Instant::now();
+        metrics.push_from_backend_util(t0, 0, 0.5, 2);
+        metrics.push_from_backend_util(t0 + Duration::from_secs(1), 100, 0.5, 2);
+        assert_eq!(metrics.iops_over(Duration::from_secs(60)), Some(100));
+        assert_eq!(
+            metrics.cpu_us_per_io_over(Duration::from_secs(60)),
+            Some(10_000)
         );
     }
 
