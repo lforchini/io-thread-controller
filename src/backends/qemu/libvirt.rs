@@ -140,29 +140,20 @@ impl LibvirtConn {
     /// libvirt-side failure (missing / gone vm, disconnect);
     /// callers treat that as "cap unknown" and skip the check.
     pub async fn qemu_max_vcpus(&self, uuid: &Uuid) -> Result<u32, QemuError> {
-        let conn = self.inner.clone();
-        let uuid = uuid.to_string();
-        task::spawn_blocking(move || -> Result<u32, QemuError> {
-            let vm = Domain::lookup_by_uuid_string(&conn, &uuid)
-                .map_err(|e| QemuError::Io(IoError::other(format!("lookup_vm({uuid}): {e}"))))?;
+        self.with_domain(uuid.to_string(), "max_vcpus", |vm, uuid| {
             vm.get_max_vcpus()
                 .map(|n| n as u32)
-                .map_err(|e| QemuError::Io(IoError::other(format!("get_max_vcpus({uuid}): {e}"))))
+                .map_err(|e| libvirt_error(format!("get_max_vcpus({uuid})"), e))
         })
         .await
-        .map_err(|e| QemuError::Parse(format!("spawn_blocking max_vcpus: {e}")))?
     }
 
     /// Return the host process ID for a libvirt vm, or zero if unavailable.
     pub async fn qemu_host_pid(&self, uuid: &Uuid) -> Result<i32, QemuError> {
-        let conn = self.inner.clone();
-        let uuid = uuid.to_string();
-        task::spawn_blocking(move || -> Result<i32, QemuError> {
-            let vm = Domain::lookup_by_uuid_string(&conn, &uuid)
-                .map_err(|e| QemuError::Io(IoError::other(format!("lookup_vm({uuid}): {e}"))))?;
+        self.with_domain(uuid.to_string(), "pid", |vm, uuid| {
             let name = vm
                 .get_name()
-                .map_err(|e| QemuError::Io(IoError::other(format!("vm name({uuid}): {e}"))))?;
+                .map_err(|e| libvirt_error(format!("vm name({uuid})"), e))?;
             for path in [
                 format!("/run/libvirt/qemu/{name}.pid"),
                 format!("/var/run/libvirt/qemu/{name}.pid"),
@@ -177,8 +168,32 @@ impl LibvirtConn {
             Ok(0)
         })
         .await
-        .map_err(|e| QemuError::Parse(format!("spawn_blocking pid: {e}")))?
     }
+
+    /// Look up the domain with `uuid` and run `f` on it in a blocking task.
+    ///
+    /// `what` names the operation in the error returned if the task itself
+    /// fails; `f` also receives the UUID for its own error context.
+    async fn with_domain<T: Send + 'static>(
+        &self,
+        uuid: String,
+        what: &'static str,
+        f: impl FnOnce(&Domain, &str) -> Result<T, QemuError> + Send + 'static,
+    ) -> Result<T, QemuError> {
+        let conn = self.inner.clone();
+        task::spawn_blocking(move || {
+            let vm = Domain::lookup_by_uuid_string(&conn, &uuid)
+                .map_err(|e| libvirt_error(format!("lookup_vm({uuid})"), e))?;
+            f(&vm, &uuid)
+        })
+        .await
+        .map_err(|e| QemuError::Parse(format!("spawn_blocking {what}: {e}")))?
+    }
+}
+
+/// Wrap a libvirt failure with the operation that produced it.
+fn libvirt_error(context: String, error: virt::error::Error) -> QemuError {
+    QemuError::Io(IoError::other(format!("{context}: {error}")))
 }
 
 fn xml_has_virtio_scsi(xml: &str) -> bool {
@@ -246,20 +261,13 @@ impl LibvirtQmp {
         let body = serde_json::to_string(&req)
             .map_err(|e| QemuError::Parse(format!("marshal {cmd}: {e}")))?;
         let cmd_owned = cmd.to_string();
-        let uuid = self.uuid.clone();
-        let conn = self.conn.inner.clone();
-        let raw = task::spawn_blocking(move || -> Result<String, QemuError> {
-            let vm: Domain = Domain::lookup_by_uuid_string(&conn, &uuid)
-                .map_err(|e| QemuError::Io(IoError::other(format!("lookup_vm({uuid}): {e}"))))?;
-            vm.qemu_monitor_command(&body, sys::VIR_DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
-                .map_err(|e| {
-                    QemuError::Io(IoError::other(format!(
-                        "qemu_monitor_command({cmd_owned}): {e}"
-                    )))
-                })
-        })
-        .await
-        .map_err(|e| QemuError::Parse(format!("spawn_blocking qmp: {e}")))??;
+        let raw = self
+            .conn
+            .with_domain(self.uuid.clone(), "qmp", move |vm, _| {
+                vm.qemu_monitor_command(&body, sys::VIR_DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
+                    .map_err(|e| libvirt_error(format!("qemu_monitor_command({cmd_owned})"), e))
+            })
+            .await?;
         parse_qmp_envelope(cmd, &raw)
     }
 
