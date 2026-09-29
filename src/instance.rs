@@ -187,10 +187,7 @@ impl Instance {
             pid,
             thread_name_filter: ThreadNameFilter::default(),
             client: Box::new(client),
-            status: RwLock::new(InstanceStatus {
-                scaling_allowed: true,
-                ..Default::default()
-            }),
+            status: RwLock::new(InstanceStatus::default()),
         }
     }
 
@@ -379,9 +376,6 @@ pub struct InstanceStatus {
     pub vcpu_count: u32,
     /// Whether the last refresh succeeded.
     pub alive: bool,
-    /// Whether backend ownership policy permits automatic scaling.
-    /// FIXME this was removed no back again?
-    pub scaling_allowed: bool,
     /// Persisted ownership classification, or `None` before the first usable
     /// snapshot of a previously unknown VM.
     pub ownership_classification: Option<bool>,
@@ -429,6 +423,7 @@ pub struct InstanceStatus {
 }
 
 impl InstanceStatus {
+    /// Whether backend ownership policy permits automatic scaling.
     pub fn scaling_allowed(&self) -> bool {
         self.ownership_classification.unwrap_or(false)
     }
