@@ -8,7 +8,7 @@ TARGET ?= debug
 # Extra cargo feature flags. Defaults come from Cargo.toml
 # (`qemu`, `threshold-engine`, `tui`). Examples:
 #   make                              # default features, including iothread-tui
-#   make CARGO_FEATURES='--no-default-features --features qemu,threshold-engine'
+#   make CARGO_FEATURES='--no-default-features --features qemu-backend,threshold-engine'
 #                                     # daemon only (no TUI)
 CARGO_FEATURES ?=
 
@@ -24,10 +24,9 @@ release:
 	$(CARGO_BUILD) --release
 
 CARGO_FMT_FLAGS = --config wrap_comments=true
-CARGO_FMT = cargo fmt -- $(CARGO_FMT_FLAGS)
-CARGO_CLIPPY = cargo clippy --tests --locked
-CARGO_CLIPPY_FLAGS = --all-features --all-targets -- \
-	-D warnings -D clippy::use_self -W dead_code
+CARGO_FMT = cargo fmt --all -- $(CARGO_FMT_FLAGS)
+CARGO_CLIPPY = cargo clippy --all-features --all-targets --tests --locked
+CARGO_CLIPPY_FLAGS = -- -D warnings -D clippy::use_self -W dead_code
 CARGO_BUILD = cargo build --locked $(CARGO_FEATURES)
 
 .PHONY: check
