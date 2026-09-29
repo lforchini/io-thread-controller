@@ -16,7 +16,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io,
-    ops::Sub,
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
@@ -205,10 +204,12 @@ impl CpuSample {
         Ok(out)
     }
 
-    /// Compute average per-IOThread CPU utilisation between two samples.
-    // TODO add unit test for this function and the call site, and that it can be
-    // folded into the Sub.
-    pub fn diff_jiffies_sample(prev: &Self, cur: &Self) -> f64 {
+    /// Average per-IOThread CPU utilisation between `prev` and this sample.
+    ///
+    /// Threads missing from `prev` or whose counters went backwards are
+    /// skipped; returns 0.0 when nothing is comparable.
+    pub fn utilisation_since(&self, prev: &Self) -> f64 {
+        let cur = self;
         let Some(elapsed) = cur.wall.checked_duration_since(prev.wall) else {
             return 0.0;
         };
@@ -236,13 +237,6 @@ impl CpuSample {
             return 0.0;
         }
         total / counted as f64
-    }
-}
-
-impl Sub<&CpuSample> for &CpuSample {
-    type Output = f64;
-    fn sub(self, rhs: &CpuSample) -> Self::Output {
-        CpuSample::diff_jiffies_sample(rhs, self)
     }
 }
 
@@ -289,6 +283,26 @@ mod tests {
 
     /// Test that vQ round-robin mapping spreads queues across IOThreads
     /// as evenly as possible.
+    /// Test that utilisation averages comparable threads and skips new or
+    /// reset ones.
+    #[test]
+    fn utilisation_since_averages_comparable_threads() {
+        let hz = param::clock_ticks_per_second();
+        let t0 = Instant::now();
+        let prev = CpuSample {
+            jiffies: HashMap::from([(1, 0), (2, 0), (3, 10 * hz)]),
+            wall: t0,
+        };
+        let cur = CpuSample {
+            // Over 2s: tid 1 used 1s (0.5), tid 2 used 0s, tid 3 reset
+            // (skipped), tid 4 is new (skipped).
+            jiffies: HashMap::from([(1, hz), (2, 0), (3, 0), (4, 5 * hz)]),
+            wall: t0 + std::time::Duration::from_secs(2),
+        };
+        assert!((cur.utilisation_since(&prev) - 0.25).abs() < 1e-9);
+        assert_eq!(prev.utilisation_since(&cur), 0.0);
+    }
+
     #[test]
     fn round_robin_distributes_evenly() {
         let ids = vec!["iot0".to_string(), "iot1".to_string(), "iot2".to_string()];

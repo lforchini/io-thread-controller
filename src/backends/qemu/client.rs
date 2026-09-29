@@ -18,7 +18,7 @@
 //! Everything the controller used to keep in `QemuInstance` /
 //! `QemuState` now lives here, behind the generic per-VM interface.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use procfs::process::Process;
@@ -35,7 +35,7 @@ use crate::{
             libvirt::LibvirtQmp,
         },
     },
-    instance::{InstanceClient, ThreadPoolSnapshot},
+    instance::{InstanceClient, InstancePerfSample, ThreadPoolSnapshot},
 };
 
 /// Wire client for an QEMU-managed VM.
@@ -145,6 +145,26 @@ impl QemuInstanceClient {
         Ok(s.iothreads.len() as u32)
     }
 
+    /// Block-device I/O counters, feeding revert-on-drop validation the same
+    /// IOPS signal as other backends.
+    ///
+    /// Best-effort: a failure is logged at debug and yields no counters
+    /// rather than failing the whole snapshot.
+    async fn query_perf(&self) -> Option<InstancePerfSample> {
+        match self.client.query_blockstats().await {
+            Ok(perf) => perf,
+            Err(e) => {
+                tracing::debug!(
+                    target: "qemu",
+                    uuid = %self.uuid,
+                    error = ?e,
+                    "query-blockstats failed"
+                );
+                None
+            }
+        }
+    }
+
     /// Build a best-effort snapshot from cached topology when this host QEMU
     /// does not implement `x-query-prometheus-metrics`.
     async fn snapshot_from_cached_topology(
@@ -164,23 +184,9 @@ impl QemuInstanceClient {
             );
         }
 
-        // Keep perf counters best-effort, same policy as the normal path.
-        let perf = match self.client.query_blockstats().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(
-                    target: "qemu",
-                    uuid = %self.uuid,
-                    error = ?e,
-                    "query-blockstats failed"
-                );
-                None
-            }
-        };
-
         Ok(ThreadPoolSnapshot {
             thread_count,
-            perf,
+            perf: self.query_perf().await,
             // Cannot derive per-thread util without fresh topology/TID data.
             per_thread_util: None,
             vcpu_count: self.vcpu_count,
@@ -191,28 +197,16 @@ impl QemuInstanceClient {
 #[async_trait]
 impl InstanceClient for QemuInstanceClient {
     async fn set_thread_count(&self, target: u32) -> Result<(), BackendClientError> {
-        // Call scale_up until actual thread count reaches the target (noop if
-        // it's already there, so on scale down this never executes).
+        // Step one IOThread at a time towards the target, stopping early if a
+        // step makes no progress.
         loop {
-            let cur = self.inner.lock().await.iothreads.len() as u32;
-            if cur >= target {
-                break;
-            }
-            let new = self.scale_up().await?;
-            if new == cur {
-                break;
-            }
-        }
-
-        // Call scale_down until actual thread count reaches the target (noop
-        // if it's already there, so on scale up this never executes).
-        loop {
-            let cur = self.inner.lock().await.iothreads.len() as u32;
-            if cur <= target {
-                break;
-            }
-            let new = self.scale_down().await?;
-            if new == cur {
+            let current = self.inner.lock().await.iothreads.len() as u32;
+            let next = match current.cmp(&target) {
+                Ordering::Less => self.scale_up().await?,
+                Ordering::Greater => self.scale_down().await?,
+                Ordering::Equal => break,
+            };
+            if next == current {
                 break;
             }
         }
@@ -284,38 +278,18 @@ impl InstanceClient for QemuInstanceClient {
         s.device_path = topo.device_path.clone();
         s.vq_count = topo.vq_count;
 
-        let per_thread_util = if let Some(prev) = s.last_sample.take() {
-            let util = &sample - &prev;
-            s.last_sample = Some(sample);
-            Some(util)
-        } else {
-            // Warm-up tick: report None so the engine leaves
-            // per_thread_util at 0.0.  Next tick has a `prev`
-            // sample and returns a real delta.
-            s.last_sample = Some(sample);
-            None
-        };
-        // Feed block statistics to the engine so
-        // revert-on-drop validation compares apples to apples
-        // across backends.  A best-effort call: an error here
-        // shouldn't drop the whole snapshot, so we downgrade to
-        // an empty perf sample and log at debug.
-        let perf = match self.client.query_blockstats().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(
-                    target: "qemu",
-                    uuid = %self.uuid,
-                    error = ?e,
-                    "query-blockstats failed"
-                );
-                None
-            }
-        };
-        let thread_count = topo.iothreads.len() as u32;
+        // The first sample has nothing to diff against, so it reports no
+        // utilisation; later samples return a real delta.
+        let per_thread_util = s
+            .last_sample
+            .as_ref()
+            .map(|previous| sample.utilisation_since(previous));
+        s.last_sample = Some(sample);
+        drop(s);
+
         Ok(ThreadPoolSnapshot {
-            thread_count,
-            perf,
+            thread_count: topo.iothreads.len() as u32,
+            perf: self.query_perf().await,
             per_thread_util,
             vcpu_count: self.vcpu_count,
         })
