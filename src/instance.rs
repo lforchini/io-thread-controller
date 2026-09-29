@@ -197,7 +197,10 @@ impl Instance {
         self
     }
 
-    /// Refresh one VM and mark its client broken on failure.
+    /// Refresh one VM from its backend.
+    ///
+    /// Returns `false` and marks the VM dead when the backend snapshot fails;
+    /// the controller then removes the instance and closes its client.
     #[tracing::instrument(skip(self), fields(id = %self.id))]
     pub async fn refresh_state(&self) -> bool {
         match self.client.get_thread_pool_snapshot().await {
@@ -209,7 +212,6 @@ impl Instance {
                     "refresh failed; removing instance"
                 );
                 self.status.write().await.alive = false;
-                self.client.close().await;
                 false
             }
         }
@@ -601,11 +603,6 @@ fn read_cpu_sample(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-
     use async_trait::async_trait;
 
     use super::*;
@@ -633,9 +630,7 @@ mod tests {
         async fn close(&self) {}
     }
 
-    struct FailingClient {
-        closed: Arc<AtomicBool>,
-    }
+    struct FailingClient;
 
     #[async_trait]
     impl InstanceClient for FailingClient {
@@ -647,9 +642,7 @@ mod tests {
             Err(BackendClientError::Disconnected("gone".into()))
         }
 
-        async fn close(&self) {
-            self.closed.store(true, Ordering::Relaxed);
-        }
+        async fn close(&self) {}
     }
 
     /// Test that a successful client snapshot updates
@@ -668,23 +661,13 @@ mod tests {
         assert_eq!(status.thread_count, 3);
     }
 
-    /// Test that client errors mark the instance dead and close the
-    /// client.
+    /// Test that client errors mark the instance dead.
     #[tokio::test]
-    async fn refresh_state_marks_failed_instances_dead_and_closes() {
-        let closed = Arc::new(AtomicBool::new(false));
-        let instance = Instance::new(
-            "vm-bad".to_string(),
-            Path::new(""),
-            9,
-            FailingClient {
-                closed: Arc::clone(&closed),
-            },
-        );
+    async fn refresh_state_marks_failed_instances_dead() {
+        let instance = Instance::new("vm-bad".to_string(), Path::new(""), 9, FailingClient);
         assert!(!instance.refresh_state().await);
         let status = instance.status.read().await;
         assert!(!status.alive);
-        assert!(closed.load(Ordering::Relaxed));
     }
 
     /// Test that `Display` for an instance prints the bare VM id.
