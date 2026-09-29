@@ -10,7 +10,12 @@
 //! A [`crate::backends::Backend`] is the fleet-level adapter that owns
 //! backend-wide configuration and discovers zero or more such records.
 
-use std::{collections::HashMap, fmt, sync::LazyLock, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use procfs::process::Process;
@@ -294,47 +299,21 @@ impl Instance {
     }
 
     /// Refresh per-tick rates from cumulative backend counters.
+    ///
+    /// A snapshot without counters counts as all zeros.
     fn update_perf_rates(
         status: &mut InstanceStatus,
         perf: &Option<InstancePerfSample>,
         now: Instant,
     ) {
-        let (read_io_count, write_io_count, other_io_count, read_bytes_total, write_bytes_total) =
-            match perf {
-                Some(perf) => (
-                    perf.read_io_count,
-                    perf.write_io_count,
-                    perf.other_io_count,
-                    perf.read_bytes_total,
-                    perf.write_bytes_total,
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-        if let Some(previous_time) = status.previous_perf_time {
-            let elapsed_ns = now
-                .checked_duration_since(previous_time)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            if elapsed_ns > 0 {
-                let rate = |current: u64, previous: u64| -> u64 {
-                    let delta = current.saturating_sub(previous);
-                    ((delta as u128).saturating_mul(1_000_000_000) / elapsed_ns) as u64
-                };
-                status.read_iops = rate(read_io_count, status.previous_read_io_count);
-                status.write_iops = rate(write_io_count, status.previous_write_io_count);
-                status.other_iops = rate(other_io_count, status.previous_other_io_count);
-                status.read_bytes_per_second =
-                    rate(read_bytes_total, status.previous_read_bytes_total);
-                status.write_bytes_per_second =
-                    rate(write_bytes_total, status.previous_write_bytes_total);
+        let current = perf.unwrap_or_default();
+        if let Some((previous_time, previous)) = status.previous_perf {
+            let elapsed = now.saturating_duration_since(previous_time);
+            if !elapsed.is_zero() {
+                status.rates = current.rates_since(&previous, elapsed);
             }
         }
-        status.previous_perf_time = Some(now);
-        status.previous_read_io_count = read_io_count;
-        status.previous_write_io_count = write_io_count;
-        status.previous_other_io_count = other_io_count;
-        status.previous_read_bytes_total = read_bytes_total;
-        status.previous_write_bytes_total = write_bytes_total;
+        status.previous_perf = Some((now, current));
     }
 }
 
@@ -401,28 +380,10 @@ pub struct InstanceStatus {
     pub last_worker_names: Option<Vec<String>>,
     /// Bounded 1m/5m/15m I/O and CPU history.
     pub rolling: RollingMetrics,
-    /// Time of the previous backend performance snapshot.
-    pub previous_perf_time: Option<Instant>,
-    /// Previous cumulative read count.
-    pub previous_read_io_count: u64,
-    /// Previous cumulative write count.
-    pub previous_write_io_count: u64,
-    /// Previous cumulative other-operation count.
-    pub previous_other_io_count: u64,
-    /// Previous cumulative read-byte count.
-    pub previous_read_bytes_total: u64,
-    /// Previous cumulative write-byte count.
-    pub previous_write_bytes_total: u64,
-    /// Latest read rate in operations per second.
-    pub read_iops: u64,
-    /// Latest write rate in operations per second.
-    pub write_iops: u64,
-    /// Latest other-operation rate per second.
-    pub other_iops: u64,
-    /// Latest read bandwidth in bytes per second.
-    pub read_bytes_per_second: u64,
-    /// Latest write bandwidth in bytes per second.
-    pub write_bytes_per_second: u64,
+    /// Previous backend performance counters and when they were sampled.
+    pub previous_perf: Option<(Instant, InstancePerfSample)>,
+    /// Latest per-second I/O rates derived from successive snapshots.
+    pub rates: IoRates,
 }
 
 impl InstanceStatus {
@@ -508,6 +469,40 @@ impl InstancePerfSample {
             .saturating_add(self.write_io_count)
             .saturating_add(self.other_io_count)
     }
+
+    /// Per-second rates between an earlier sample and this one.
+    ///
+    /// Counters that went backwards yield a zero rate. `elapsed` must be
+    /// non-zero.
+    pub fn rates_since(&self, previous: &Self, elapsed: Duration) -> IoRates {
+        let elapsed_ns = elapsed.as_nanos();
+        let rate = |current: u64, previous: u64| -> u64 {
+            let delta = current.saturating_sub(previous);
+            ((delta as u128).saturating_mul(1_000_000_000) / elapsed_ns) as u64
+        };
+        IoRates {
+            read_iops: rate(self.read_io_count, previous.read_io_count),
+            write_iops: rate(self.write_io_count, previous.write_io_count),
+            other_iops: rate(self.other_io_count, previous.other_io_count),
+            read_bytes_per_second: rate(self.read_bytes_total, previous.read_bytes_total),
+            write_bytes_per_second: rate(self.write_bytes_total, previous.write_bytes_total),
+        }
+    }
+}
+
+/// Per-second I/O rates between two performance samples.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoRates {
+    /// Read rate in operations per second.
+    pub read_iops: u64,
+    /// Write rate in operations per second.
+    pub write_iops: u64,
+    /// Other-operation rate per second.
+    pub other_iops: u64,
+    /// Read bandwidth in bytes per second.
+    pub read_bytes_per_second: u64,
+    /// Write bandwidth in bytes per second.
+    pub write_bytes_per_second: u64,
 }
 
 /// One backend snapshot consumed by the controller and engine.
@@ -774,6 +769,36 @@ mod tests {
             .get_io_thread_vq_mapping("dev")
             .await
             .unwrap();
+    }
+
+    /// Test that I/O rates scale counter deltas to one second and clamp
+    /// counter resets to zero.
+    #[test]
+    fn rates_since_scales_deltas_per_second() {
+        let previous = InstancePerfSample {
+            read_io_count: 100,
+            write_io_count: 50,
+            other_io_count: 10,
+            read_bytes_total: 4_000,
+            write_bytes_total: 9_000,
+        };
+        let current = InstancePerfSample {
+            read_io_count: 300,
+            write_io_count: 50,
+            other_io_count: 5,
+            read_bytes_total: 12_000,
+            write_bytes_total: 9_500,
+        };
+        assert_eq!(
+            current.rates_since(&previous, Duration::from_secs(2)),
+            IoRates {
+                read_iops: 100,
+                write_iops: 0,
+                other_iops: 0,
+                read_bytes_per_second: 4_000,
+                write_bytes_per_second: 250,
+            }
+        );
     }
 
     use super::{TaskCpuSample, compute_per_worker_util};
