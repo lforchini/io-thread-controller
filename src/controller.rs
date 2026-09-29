@@ -577,66 +577,56 @@ impl Controller {
                 target,
                 "dry-run: would scale"
             );
-            if action.is_ordinary() {
-                instance.status.write().await.cooldown_until =
-                    Some(Instant::now() + Duration::from_secs_f64(self.cfg.cooldown_secs));
-            }
+        } else if let Err(error) = instance.client.set_thread_count(target).await {
+            let error_text = error.to_string();
             self.engine
-                .on_applied(
-                    &instance.id,
-                    AppliedOutcome::DryRun {
-                        action,
-                        prev_thread_count: previous_count,
-                        prev_io_count_total: previous_io_count,
-                    },
-                )
+                .on_applied(&instance.id, AppliedOutcome::Failed { action, error })
                 .await;
+            tracing::warn!(
+                target: "controller",
+                event = "scale_failed",
+                vm = %instance.id,
+                action = %action,
+                target,
+                error = %error_text
+            );
             return Ok(());
         }
 
-        match instance.client.set_thread_count(target).await {
-            Ok(()) => {
-                let mut status = instance.status.write().await;
+        {
+            let mut status = instance.status.write().await;
+            if !self.cfg.dry_run {
                 status.thread_count = target;
-                if action.is_ordinary() {
-                    status.cooldown_until =
-                        Some(Instant::now() + Duration::from_secs_f64(self.cfg.cooldown_secs));
-                }
-                drop(status);
-                self.engine
-                    .on_applied(
-                        &instance.id,
-                        AppliedOutcome::Success {
-                            action,
-                            prev_thread_count: previous_count,
-                            prev_io_count_total: previous_io_count,
-                        },
-                    )
-                    .await;
-                tracing::info!(
-                    target: "controller",
-                    event = "scale_applied",
-                    vm = %instance.id,
-                    action = %action,
-                    target,
-                    prev_thread_count = previous_count,
-                    prev_io_count_total = previous_io_count
-                );
             }
-            Err(error) => {
-                let error_text = error.to_string();
-                self.engine
-                    .on_applied(&instance.id, AppliedOutcome::Failed { action, error })
-                    .await;
-                tracing::warn!(
-                    target: "controller",
-                    event = "scale_failed",
-                    vm = %instance.id,
-                    action = %action,
-                    target,
-                    error = %error_text
-                );
+            if action.is_ordinary() {
+                status.cooldown_until =
+                    Some(Instant::now() + Duration::from_secs_f64(self.cfg.cooldown_secs));
             }
+        }
+        let outcome = if self.cfg.dry_run {
+            AppliedOutcome::DryRun {
+                action,
+                prev_thread_count: previous_count,
+                prev_io_count_total: previous_io_count,
+            }
+        } else {
+            AppliedOutcome::Success {
+                action,
+                prev_thread_count: previous_count,
+                prev_io_count_total: previous_io_count,
+            }
+        };
+        self.engine.on_applied(&instance.id, outcome).await;
+        if !self.cfg.dry_run {
+            tracing::info!(
+                target: "controller",
+                event = "scale_applied",
+                vm = %instance.id,
+                action = %action,
+                target,
+                prev_thread_count = previous_count,
+                prev_io_count_total = previous_io_count
+            );
         }
         Ok(())
     }
@@ -912,6 +902,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(target.load(Ordering::Relaxed), 3);
+    }
+
+    /// Test that dry-run skips actuation but still starts cooldown.
+    #[test(tokio::test)]
+    async fn dry_run_skips_actuation_and_starts_cooldown() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            vm_state_path: Path::new(&state_dir.path().join("ownership.json")),
+            dry_run: true,
+            ..Default::default()
+        };
+        let target = Arc::new(AtomicU32::new(2));
+        let instance = Arc::new(Instance::new(
+            "dry-run".to_string(),
+            Path::new(""),
+            0,
+            VcpuLimitedClient {
+                target: Arc::clone(&target),
+            },
+        ));
+        {
+            let mut status = instance.status.write().await;
+            status.thread_count = 2;
+            status.vcpu_count = 4;
+            status.ownership_classification = Some(true);
+        }
+        let mut controller = Controller::new(
+            cfg,
+            Box::new(ThresholdEngine::new(ThresholdConfig::default())),
+        )
+        .unwrap();
+        controller
+            .instances
+            .insert(instance.id.clone(), Arc::clone(&instance));
+
+        controller
+            .apply_engine_decision(&instance.id, ScaleAction::Up(3))
+            .await
+            .unwrap();
+
+        assert_eq!(target.load(Ordering::Relaxed), 2);
+        let status = instance.status.read().await;
+        assert_eq!(status.thread_count, 2);
+        assert!(status.cooldown_until.is_some());
     }
 
     fn guard_controller() -> (tempfile::TempDir, Controller) {
