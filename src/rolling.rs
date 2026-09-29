@@ -10,8 +10,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Uptime-style 1m/5m/15m reporting windows.
+pub const WINDOWS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+];
+
 /// Longest retained status window.
-const MAX_WINDOW: Duration = Duration::from_secs(15 * 60);
+const MAX_WINDOW: Duration = WINDOWS[2];
 
 /// Delta recorded for one successful sampling interval.
 #[derive(Debug, Clone, Copy)]
@@ -207,12 +214,13 @@ pub fn format_1_5_15<F>(metrics: &RollingMetrics, getter: F) -> String
 where
     F: Fn(&RollingMetrics, Duration) -> Option<u64>,
 {
-    [1, 5, 15]
-        .map(|minutes| {
-            getter(metrics, Duration::from_secs(minutes * 60))
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        })
+    format_cells(WINDOWS.map(|window| getter(metrics, window)))
+}
+
+/// Render one value per [`WINDOWS`] entry as `a/b/c`, using `-` for gaps.
+pub fn format_cells(values: [Option<u64>; 3]) -> String {
+    values
+        .map(|value| value.map_or_else(|| "-".to_string(), |value| value.to_string()))
         .join("/")
 }
 
