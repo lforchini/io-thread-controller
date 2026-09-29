@@ -144,6 +144,16 @@ pub fn load_config<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Resu
     Ok(val)
 }
 
+/// Load a JSON config file, using `T::default()` only when it does not exist.
+pub fn load_config_or_default<T: for<'de> Deserialize<'de> + Default>(
+    path: impl AsRef<Path>,
+) -> Result<T, ConfigError> {
+    match load_config(path) {
+        Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        result => result,
+    }
+}
+
 // TODO add a RawConfig or ValidatedConfig to ensure an unvalidated config
 // cannot be constructed outside this module.
 /// Ensures configuration is internally coherent.
@@ -270,6 +280,19 @@ mod tests {
 
         let err = load_config::<Config>(Path::new(path.to_str().unwrap())).unwrap_err();
         assert!(matches!(err, ConfigError::SerdeJson(_)));
+    }
+
+    /// Test that a missing file loads as defaults while a malformed one
+    /// is still rejected.
+    #[test]
+    fn load_config_or_default_only_defaults_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg: Config = load_config_or_default(Path::new(&path)).unwrap();
+        assert_eq!(cfg.engine, Config::default().engine);
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_config_or_default::<Config>(Path::new(&path)).is_err());
     }
 
     /// Test that pretty-printed default JSON includes engine, poll
