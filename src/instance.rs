@@ -15,6 +15,7 @@ use std::{collections::HashMap, fmt, sync::LazyLock, time::Instant};
 use async_trait::async_trait;
 use procfs::process::Process;
 use regex::Regex;
+use statistical::median;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -429,6 +430,37 @@ impl InstanceStatus {
     pub fn scaling_allowed(&self) -> bool {
         self.ownership_classification.unwrap_or(false)
     }
+
+    /// Summarise per-worker utilisation, falling back to the aggregate
+    /// per-thread value when no per-worker samples exist.
+    pub fn cpu_stats(&self) -> CpuStats {
+        if !self.per_worker_util.is_empty() {
+            let total = self.per_worker_util.iter().sum::<f64>();
+            let median = median(&self.per_worker_util);
+            return CpuStats {
+                avg_pct: (total / self.per_worker_util.len() as f64 * 100.0).round() as u64,
+                median_pct: (median * 100.0).round() as u64,
+                total_pct: (total * 100.0).round() as u64,
+            };
+        }
+
+        CpuStats {
+            avg_pct: (self.per_thread_util * 100.0).round() as u64,
+            median_pct: (self.per_thread_util * 100.0).round() as u64,
+            total_pct: (self.per_thread_util * self.thread_count as f64 * 100.0).round() as u64,
+        }
+    }
+}
+
+/// Average, median, and aggregate utilisation across sampled workers.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuStats {
+    /// Mean per-worker utilisation in percent.
+    pub avg_pct: u64,
+    /// Median per-worker utilisation in percent.
+    pub median_pct: u64,
+    /// Sum of per-worker utilisation percentages.
+    pub total_pct: u64,
 }
 
 /// Cumulative CPU counters sampled across one backend process.
