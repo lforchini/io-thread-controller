@@ -150,13 +150,8 @@ struct PendingValidation {
 }
 
 /// Per-VM counters owned by this engine.
-#[derive(Clone)]
+#[derive(Debug, Default, Clone)]
 struct InstanceState {
-    /// Original controller record retained so lifecycle-owned state can refer
-    /// to the same VM without duplicating its identity or backend handle.
-    // FIXME This is probably not needed. Only .evaluate() uses it, and that already takes
-    // a &Arc<Instance>. It seems like this contradicts the controller owning inventory design.
-    instance: Arc<Instance>,
     /// Number of consecutive polls eligible for scale-down.
     low_util_polls: u32,
     /// Successful action waiting for its performance validation sample.
@@ -164,15 +159,6 @@ struct InstanceState {
 }
 
 impl InstanceState {
-    /// Create lifecycle state for the exact controller instance.
-    fn new(instance: Arc<Instance>) -> Self {
-        Self {
-            instance,
-            low_util_polls: 0,
-            pending_validation: None,
-        }
-    }
-
     /// Retain the baseline needed to validate a completed scale action.
     fn start_validation(
         &mut self,
@@ -248,6 +234,15 @@ impl ThresholdEngine {
         }
     }
 
+    /// Whether a successful `action` is followed by IOPS validation.
+    fn validation_enabled(&self, action: ScaleAction) -> bool {
+        match action {
+            ScaleAction::Up(_) => self.cfg.scale_up_min_gain > 0.0,
+            ScaleAction::Down(_) => self.cfg.scale_down_revert_drop > 0.0,
+            ScaleAction::None | ScaleAction::Revert(_) => false,
+        }
+    }
+
     /// Validate a settled action and return its revert target on regression.
     fn validation_revert_target(
         &self,
@@ -256,28 +251,15 @@ impl ThresholdEngine {
         observed_iops: u64,
         pending: PendingValidation,
     ) -> Option<u32> {
-        let (required_iops, failed) = match pending.action {
-            ScaleAction::Up(_) => {
-                let required = pending.baseline_iops as f64 * (1.0 + self.cfg.scale_up_min_gain);
-                (
-                    required,
-                    self.cfg.scale_up_min_gain > 0.0
-                        && pending.baseline_iops > 0
-                        && (observed_iops as f64) < required,
-                )
-            }
-            ScaleAction::Down(_) => {
-                let required =
-                    pending.baseline_iops as f64 * (1.0 - self.cfg.scale_down_revert_drop);
-                (
-                    required,
-                    self.cfg.scale_down_revert_drop > 0.0
-                        && pending.baseline_iops > 0
-                        && (observed_iops as f64) < required,
-                )
-            }
+        let required_ratio = match pending.action {
+            ScaleAction::Up(_) => 1.0 + self.cfg.scale_up_min_gain,
+            ScaleAction::Down(_) => 1.0 - self.cfg.scale_down_revert_drop,
             ScaleAction::None | ScaleAction::Revert(_) => return None,
         };
+        let required_iops = pending.baseline_iops as f64 * required_ratio;
+        let failed = self.validation_enabled(pending.action)
+            && pending.baseline_iops > 0
+            && (observed_iops as f64) < required_iops;
         if !failed {
             return None;
         }
@@ -371,9 +353,7 @@ impl ScalingEngine for ThresholdEngine {
         let down_target =
             self.scale_down_target(per_thread_util, thread_count, context.min_thread_count);
         let mut state = self.state.lock().await;
-        let instance_state = state
-            .entry(instance.id.clone())
-            .or_insert_with(|| InstanceState::new(Arc::clone(instance)));
+        let instance_state = state.entry(instance.id.clone()).or_default();
 
         if let Some(mut pending) = instance_state.pending_validation.take() {
             if pending.polls_remaining > 0 {
@@ -381,12 +361,9 @@ impl ScalingEngine for ThresholdEngine {
                 instance_state.pending_validation = Some(pending);
                 return ScaleAction::None;
             }
-            if let Some(target) = self.validation_revert_target(
-                &instance_state.instance.id,
-                thread_count,
-                iops_total,
-                pending,
-            ) {
+            if let Some(target) =
+                self.validation_revert_target(&instance.id, thread_count, iops_total, pending)
+            {
                 return ScaleAction::Revert(target);
             }
         }
@@ -399,9 +376,7 @@ impl ScalingEngine for ThresholdEngine {
 
         if thread_count < context.max_thread_count && per_thread_util > self.cfg.scale_up_threshold
         {
-            // FIXME The min seems redundant given the thread count will always be less than
-            // or equal to the max_thread_count here.
-            let action = ScaleAction::Up((thread_count + 1).min(context.max_thread_count));
+            let action = ScaleAction::Up(thread_count + 1);
             log_scale_decision(instance, per_thread_util, thread_count, action);
             return action;
         }
@@ -435,42 +410,30 @@ impl ScalingEngine for ThresholdEngine {
         let Some(instance_state) = state.get_mut(instance_id) else {
             return;
         };
-        match action {
-            ScaleAction::Up(_) if self.cfg.scale_up_min_gain > 0.0 => {
-                // Reset sustain only after the controller accepted the action;
-                // a merely proposed or blocked downscale must retain the
-                // evidence accumulated by the sustain policy.
-                instance_state.low_util_polls = 0;
-                instance_state.start_validation(
-                    action,
-                    previous_thread_count,
-                    previous_iops,
-                    self.cfg.scale_validation_sample_polls,
-                );
-            }
-            ScaleAction::Down(_) if self.cfg.scale_down_revert_drop > 0.0 => {
-                // Successful actuation consumes the sustained low-utilisation
-                // run; subsequent downscaling must establish a fresh run.
-                instance_state.low_util_polls = 0;
-                instance_state.start_validation(
-                    action,
-                    previous_thread_count,
-                    previous_iops,
-                    self.cfg.scale_validation_sample_polls,
-                );
-            }
-            ScaleAction::Up(_) | ScaleAction::Down(_) => {
-                instance_state.low_util_polls = 0;
-            }
-            ScaleAction::None | ScaleAction::Revert(_) => {}
+        if !action.is_ordinary() {
+            return;
+        }
+        // Reset sustain only after the controller accepted the action: a
+        // merely proposed or blocked downscale must retain the evidence
+        // accumulated by the sustain policy, while a successful one consumes
+        // it so subsequent downscaling must establish a fresh run.
+        instance_state.low_util_polls = 0;
+        if self.validation_enabled(action) {
+            instance_state.start_validation(
+                action,
+                previous_thread_count,
+                previous_iops,
+                self.cfg.scale_validation_sample_polls,
+            );
         }
     }
 
     async fn on_instance_added(&self, instance: &Arc<Instance>) {
-        let mut state = self.state.lock().await;
-        state
+        self.state
+            .lock()
+            .await
             .entry(instance.id.clone())
-            .or_insert_with(|| InstanceState::new(Arc::clone(instance)));
+            .or_default();
     }
 
     async fn on_instance_removed(&self, instance_id: &str) {
