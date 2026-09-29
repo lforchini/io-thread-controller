@@ -31,17 +31,15 @@ pub(crate) fn emit_legend() {
 /// Emit configured per-VM and aggregate status lines.
 pub(crate) async fn emit_status_lines(cfg: &Config, instances: &HashMap<String, Arc<Instance>>) {
     let mut total_threads = 0u64;
-    let mut aggregate_iops = [0u64; 3];
-    let mut aggregate_has_iops = [false; 3];
+    let mut aggregate_iops: [Option<u64>; 3] = [None; 3];
     let mut fleet: Vec<_> = instances.values().collect();
     fleet.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     for instance in fleet {
         let status = instance.status.read().await;
         let iops_windows = WINDOWS.map(|window| status.rolling.iops_over(window));
-        for (index, value) in iops_windows.iter().enumerate() {
+        for (total, value) in aggregate_iops.iter_mut().zip(iops_windows) {
             if let Some(value) = value {
-                aggregate_iops[index] = aggregate_iops[index].saturating_add(*value);
-                aggregate_has_iops[index] = true;
+                *total = Some(total.unwrap_or(0).saturating_add(value));
             }
         }
         if cfg.enable_per_vm_status_line {
@@ -51,13 +49,11 @@ pub(crate) async fn emit_status_lines(cfg: &Config, instances: &HashMap<String, 
     }
 
     if cfg.enable_aggregate_status_line {
-        let aggregate =
-            std::array::from_fn(|idx| aggregate_has_iops[idx].then_some(aggregate_iops[idx]));
         tracing::info!(
             target: "status",
             tracked = instances.len(),
             total_threads,
-            iops_1_5_15m = %format_cells(aggregate),
+            iops_1_5_15m = %format_cells(aggregate_iops),
             "aggregate"
         );
     }
