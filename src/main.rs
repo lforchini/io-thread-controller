@@ -91,7 +91,7 @@ enum LogStyle {
 #[tokio::main]
 async fn main() -> Result<(), IoThreadControllerError> {
     let bootstrap_cfg = Config::default();
-    let bootstrap_backends = registered_backends(&bootstrap_cfg)?;
+    let bootstrap_backends = registered_backends(&bootstrap_cfg.backend_config_dir)?;
     let mut command = Cli::command();
     for backend in &bootstrap_backends {
         if let Some(subcommand) = backend.cli_subcommand() {
@@ -127,7 +127,7 @@ async fn main() -> Result<(), IoThreadControllerError> {
         cfg.dry_run = true;
     }
     validate_config(&cfg)?;
-    let backends = registered_backends(&cfg)?;
+    let backends = registered_backends(&cfg.backend_config_dir)?;
     run(cfg, backends).await?;
     Ok(())
 }
@@ -139,18 +139,10 @@ fn init_logging(filter: &str, style: LogStyle) {
     // Presence is enough; the value itself is only useful when
     // deciding whether to talk journald's native protocol
     // (which we do not).
-    let journal = std::env::var_os("JOURNAL_STREAM").is_some();
-    let effective_style = match style {
-        LogStyle::Human => LogStyle::Human,
-        LogStyle::Systemd => LogStyle::Systemd,
-        LogStyle::Json => LogStyle::Json,
-        LogStyle::Auto => {
-            if journal {
-                LogStyle::Systemd
-            } else {
-                LogStyle::Human
-            }
-        }
+    let style = match style {
+        LogStyle::Auto if std::env::var_os("JOURNAL_STREAM").is_some() => LogStyle::Systemd,
+        LogStyle::Auto => LogStyle::Human,
+        style => style,
     };
     let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -159,7 +151,7 @@ fn init_logging(filter: &str, style: LogStyle) {
     // is chained, so we build and install each branch in its
     // own scope rather than fighting the type system to
     // unify them.
-    match effective_style {
+    match style {
         LogStyle::Systemd => {
             let subscriber = tracing_subscriber::fmt()
                 // Keep target so downstream routing can separate

@@ -20,7 +20,7 @@ use serde_json;
 use thiserror::Error;
 
 use crate::{
-    config::{Config, ConfigError},
+    config::ConfigError,
     instance::{Instance, InstanceClient, InstanceError},
     util::Path,
 };
@@ -198,13 +198,14 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// Construct the backends compiled into the daemon.
-// FIXME shouldn't take the whole config, just the path
-pub fn registered_backends(cfg: &Config) -> Result<Vec<Box<dyn Backend>>, BackendClientError> {
-    let dir = &cfg.backend_config_dir;
+/// Construct the backends compiled into the daemon from their
+/// configuration directory.
+pub fn registered_backends(
+    backend_config_dir: &Path,
+) -> Result<Vec<Box<dyn Backend>>, BackendClientError> {
     let mut backends = Vec::new();
     for registration in BACKENDS {
-        backends.push((registration.build)(dir)?);
+        backends.push((registration.build)(backend_config_dir)?);
     }
     // linkme iteration order is unspecified; keep a stable order so
     // dual-backend discovery remains deterministic across runs.
