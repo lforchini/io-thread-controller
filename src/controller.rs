@@ -282,50 +282,11 @@ impl Controller {
             DbusRequest::GetVersion { reply } => {
                 let _ = reply.send(VERSION.to_string());
             }
-            DbusRequest::GetIoThreadVqMapping { vm, device, reply } => {
-                let result = match self.instances.get(&vm) {
-                    Some(instance) => instance
-                        .client
-                        .get_io_thread_vq_mapping(&device)
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|mapping| {
-                            serde_json::to_string(&mapping)
-                                .map_err(|error| format!("serialize mapping: {error}"))
-                        }),
-                    None => Err(format!("unknown VM {vm}")),
-                };
-                let _ = reply.send(result);
-            }
             DbusRequest::GetStats { reply } => {
-                let mut vms = Vec::with_capacity(self.instances.len());
-                for (id, instance) in &self.instances {
-                    let status = instance.status.read().await;
-                    let (read_io_count, write_io_count, other_io_count) = match status.perf {
-                        Some(perf) => {
-                            (perf.read_io_count, perf.write_io_count, perf.other_io_count)
-                        }
-                        None => (0, 0, 0),
-                    };
-                    vms.push(serde_json::json!({
-                        "vm": id,
-                        "thread_count": status.thread_count,
-                        "manual_scaling_sticky": status.manual_scaling_sticky,
-                        "scaling_allowed": status.scaling_allowed(),
-                        "vcpu_count": status.vcpu_count,
-                        "per_thread_util": status.per_thread_util,
-                        // FIXME omit if status.perf.is_none()?
-                        "read_io_count": read_io_count,
-                        "write_io_count": write_io_count,
-                        "other_io_count": other_io_count,
-                    }));
-                }
-                let snapshot = serde_json::json!({
-                    "tick": self.tick_index,
-                    "vms": vms,
-                })
-                .to_string();
-                let _ = reply.send(snapshot);
+                let _ = reply.send(self.handle_get_stats().await);
+            }
+            DbusRequest::GetIoThreadVqMapping { vm, device, reply } => {
+                let _ = reply.send(self.handle_get_io_thread_vq_mapping(&vm, &device).await);
             }
             DbusRequest::AddIoThread {
                 vm,
@@ -333,32 +294,10 @@ impl Controller {
                 poll_max_ns,
                 reply,
             } => {
-                let result = match self.instances.get(&vm) {
-                    Some(instance) => {
-                        let properties = (poll_max_ns >= 0).then(|| IoThreadProperties {
-                            poll_max_ns: Some(poll_max_ns),
-                            ..Default::default()
-                        });
-                        instance
-                            .client
-                            .add_io_thread(&id, properties.as_ref())
-                            .await
-                            .map_err(|error| error.to_string())
-                    }
-                    None => Err(format!("unknown VM {vm}")),
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(self.handle_add_io_thread(&vm, &id, poll_max_ns).await);
             }
             DbusRequest::DelIoThread { vm, id, reply } => {
-                let result = match self.instances.get(&vm) {
-                    Some(instance) => instance
-                        .client
-                        .del_io_thread(&id)
-                        .await
-                        .map_err(|error| error.to_string()),
-                    None => Err(format!("unknown VM {vm}")),
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(self.handle_del_io_thread(&vm, &id).await);
             }
             DbusRequest::SetIoThreadVqMapping {
                 vm,
@@ -366,20 +305,107 @@ impl Controller {
                 mapping_json,
                 reply,
             } => {
-                let result = match serde_json::from_str::<Vec<VqMapping>>(&mapping_json) {
-                    Ok(mapping) => match self.instances.get(&vm) {
-                        Some(instance) => instance
-                            .client
-                            .set_io_thread_vq_mapping(&device, &mapping)
-                            .await
-                            .map_err(|error| error.to_string()),
-                        None => Err(format!("unknown VM {vm}")),
-                    },
-                    Err(error) => Err(format!("parse mapping JSON: {error}")),
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(
+                    self.handle_set_io_thread_vq_mapping(&vm, &device, &mapping_json)
+                        .await,
+                );
             }
         }
+    }
+
+    /// Look up a tracked VM for a D-Bus request.
+    fn instance(&self, vm: &str) -> Result<&Arc<Instance>, String> {
+        self.instances
+            .get(vm)
+            .ok_or_else(|| format!("unknown VM {vm}"))
+    }
+
+    /// Assemble the `GetStats` JSON reply.
+    async fn handle_get_stats(&self) -> String {
+        let mut vms = Vec::with_capacity(self.instances.len());
+        for (id, instance) in &self.instances {
+            let status = instance.status.read().await;
+            let (read_io_count, write_io_count, other_io_count) = match status.perf {
+                Some(perf) => (perf.read_io_count, perf.write_io_count, perf.other_io_count),
+                None => (0, 0, 0),
+            };
+            vms.push(serde_json::json!({
+                "vm": id,
+                "thread_count": status.thread_count,
+                "manual_scaling_sticky": status.manual_scaling_sticky,
+                "scaling_allowed": status.scaling_allowed(),
+                "vcpu_count": status.vcpu_count,
+                "per_thread_util": status.per_thread_util,
+                // FIXME omit if status.perf.is_none()?
+                "read_io_count": read_io_count,
+                "write_io_count": write_io_count,
+                "other_io_count": other_io_count,
+            }));
+        }
+        serde_json::json!({
+            "tick": self.tick_index,
+            "vms": vms,
+        })
+        .to_string()
+    }
+
+    /// Read a device's virtqueue mapping as JSON.
+    async fn handle_get_io_thread_vq_mapping(
+        &self,
+        vm: &str,
+        device: &str,
+    ) -> Result<String, String> {
+        let mapping = self
+            .instance(vm)?
+            .client
+            .get_io_thread_vq_mapping(device)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&mapping).map_err(|error| format!("serialize mapping: {error}"))
+    }
+
+    /// Create a named IOThread; a negative `poll_max_ns` keeps the default.
+    async fn handle_add_io_thread(
+        &self,
+        vm: &str,
+        id: &str,
+        poll_max_ns: i64,
+    ) -> Result<(), String> {
+        let instance = self.instance(vm)?;
+        let properties = (poll_max_ns >= 0).then(|| IoThreadProperties {
+            poll_max_ns: Some(poll_max_ns),
+            ..Default::default()
+        });
+        instance
+            .client
+            .add_io_thread(id, properties.as_ref())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Delete a named IOThread.
+    async fn handle_del_io_thread(&self, vm: &str, id: &str) -> Result<(), String> {
+        self.instance(vm)?
+            .client
+            .del_io_thread(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replace a device's virtqueue mapping from its JSON encoding.
+    async fn handle_set_io_thread_vq_mapping(
+        &self,
+        vm: &str,
+        device: &str,
+        mapping_json: &str,
+    ) -> Result<(), String> {
+        let mapping: Vec<VqMapping> = serde_json::from_str(mapping_json)
+            .map_err(|error| format!("parse mapping JSON: {error}"))?;
+        self.instance(vm)?
+            .client
+            .set_io_thread_vq_mapping(device, &mapping)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Apply a debug-only manual thread-count request.
