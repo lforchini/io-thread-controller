@@ -60,6 +60,12 @@ impl ScaleAction {
             Self::Up(target) | Self::Down(target) | Self::Revert(target) => Some(target),
         }
     }
+
+    /// Whether this is an ordinary scale step, subject to cooldown, as opposed
+    /// to a hold or a validation revert.
+    pub fn is_ordinary(self) -> bool {
+        matches!(self, Self::Up(_) | Self::Down(_))
+    }
 }
 
 impl std::fmt::Display for ScaleAction {
@@ -255,6 +261,11 @@ mod tests {
         assert_eq!(ScaleAction::Up(4).target(), Some(4));
         assert_eq!(ScaleAction::Down(2).target(), Some(2));
         assert_eq!(ScaleAction::Revert(3).target(), Some(3));
+
+        assert!(ScaleAction::Up(1).is_ordinary());
+        assert!(ScaleAction::Down(1).is_ordinary());
+        assert!(!ScaleAction::Revert(1).is_ordinary());
+        assert!(!ScaleAction::None.is_ordinary());
 
         assert_eq!(ScaleAction::None.to_string(), "none");
         assert_eq!(ScaleAction::Up(1).to_string(), "up");

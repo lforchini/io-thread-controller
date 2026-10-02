@@ -618,9 +618,7 @@ impl Controller {
             );
             return Ok(());
         }
-        if matches!(action, ScaleAction::Up(_) | ScaleAction::Down(_))
-            && cooldown_until.is_some_and(|until| Instant::now() < until)
-        {
+        if action.is_ordinary() && cooldown_until.is_some_and(|until| Instant::now() < until) {
             self.report_blocked_scale(instance_id, action, BlockedReason::Cooldown)
                 .await;
             tracing::info!(
@@ -658,7 +656,7 @@ impl Controller {
                 target,
                 "dry-run: would scale"
             );
-            if matches!(action, ScaleAction::Up(_) | ScaleAction::Down(_)) {
+            if action.is_ordinary() {
                 instance.status.write().await.cooldown_until =
                     Some(Instant::now() + Duration::from_secs_f64(self.cfg.cooldown_secs));
             }
@@ -679,7 +677,7 @@ impl Controller {
             Ok(()) => {
                 let mut status = instance.status.write().await;
                 status.thread_count = target;
-                if matches!(action, ScaleAction::Up(_) | ScaleAction::Down(_)) {
+                if action.is_ordinary() {
                     status.cooldown_until =
                         Some(Instant::now() + Duration::from_secs_f64(self.cfg.cooldown_secs));
                 }
