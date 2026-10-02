@@ -112,25 +112,25 @@ impl HostCpuMonitor {
 /// Live VM inventory and per-tick driver.
 pub struct Controller {
     /// Effective daemon configuration.
-    pub cfg: Config,
+    cfg: Config,
     /// Exclusively owned engine borrowed by concurrent evaluation futures.
     ///
     /// The controller does not need shared ownership: fleet evaluation lends
     /// `&self.engine` to concurrent calls, which is safe because
     /// [`ScalingEngine`] requires both [`Send`] and [`Sync`].
-    pub engine: Box<dyn ScalingEngine>,
+    engine: Box<dyn ScalingEngine>,
     /// Atomic ownership-registry store.
-    pub vm_state_store: VmStateStore,
+    vm_state_store: VmStateStore,
     /// Restart-surviving managed and unmanaged VM sets, loaded once.
-    pub vm_ownership: VmOwnership,
+    vm_ownership: VmOwnership,
     /// Tracked VMs keyed by stable identifier.
     ///
     /// The controller needs to pass Instances to the engine for it to evaluate
     /// and decide.
     // FIXME Instance probably doesn't need to be an Arc.
-    pub instances: HashMap<String, Arc<Instance>>,
+    instances: HashMap<String, Arc<Instance>>,
     /// Monotonically increasing tick sequence.
-    pub tick_index: u64,
+    tick_index: u64,
     /// Host CPU utilisation used by the scale-up ceiling guard.
     host_cpu: HostCpuMonitor,
 }
