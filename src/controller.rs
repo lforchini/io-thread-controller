@@ -310,7 +310,7 @@ impl Controller {
                         "vm": id,
                         "thread_count": status.thread_count,
                         "manual_scaling_sticky": status.manual_scaling_sticky,
-                        "scaling_allowed": status.scaling_allowed,
+                        "scaling_allowed": status.scaling_allowed(),
                         "vcpu_count": status.vcpu_count,
                         "per_thread_util": status.per_thread_util,
                         // FIXME omit if status.perf.is_none()?
@@ -570,7 +570,6 @@ impl Controller {
             return Ok(());
         }
         if !scaling_allowed {
-            // FIXME why would an engine even consider an unmanaged VM?
             self.report_blocked_scale(&instance.id, action, BlockedReason::UnmanagedVm)
                 .await;
             tracing::info!(
