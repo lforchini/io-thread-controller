@@ -492,9 +492,9 @@ impl Controller {
         self.persist_new_classifications(&fleet).await?;
         let plan = self.engine.evaluate_fleet(&fleet, &context).await;
         for item in plan {
-            let action = item.decision;
-            self.apply_engine_decision(&item.instance_id, action)
-                .await?;
+            if let Some(instance) = self.instances.get(&item.instance_id) {
+                self.apply_engine_decision(instance, item.decision).await?;
+            }
         }
         self.emit_status_lines().await;
         Ok(())
@@ -533,16 +533,12 @@ impl Controller {
     }
 
     /// Apply one engine action after controller safety checks.
-    // FIXME why do we pass the instance ID and not a reference to the instance?
     async fn apply_engine_decision(
         &self,
-        instance_id: &str,
+        instance: &Instance,
         action: ScaleAction,
     ) -> Result<(), ControllerError> {
         let Some(target) = action.target() else {
-            return Ok(());
-        };
-        let Some(instance) = self.instances.get(instance_id) else {
             return Ok(());
         };
 
@@ -875,30 +871,30 @@ mod tests {
             .insert(instance.id.clone(), Arc::clone(&instance));
 
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(4))
+            .apply_engine_decision(&instance, ScaleAction::Up(4))
             .await
             .unwrap();
         assert_eq!(target.load(Ordering::Relaxed), 4);
 
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(5))
+            .apply_engine_decision(&instance, ScaleAction::Up(5))
             .await
             .unwrap();
         assert_eq!(target.load(Ordering::Relaxed), 4);
 
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Down(3))
+            .apply_engine_decision(&instance, ScaleAction::Down(3))
             .await
             .unwrap();
         assert_eq!(target.load(Ordering::Relaxed), 3);
 
         instance.status.write().await.ownership_classification = Some(false);
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(4))
+            .apply_engine_decision(&instance, ScaleAction::Up(4))
             .await
             .unwrap();
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Down(2))
+            .apply_engine_decision(&instance, ScaleAction::Down(2))
             .await
             .unwrap();
         assert_eq!(target.load(Ordering::Relaxed), 3);
@@ -938,7 +934,7 @@ mod tests {
             .insert(instance.id.clone(), Arc::clone(&instance));
 
         controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(3))
+            .apply_engine_decision(&instance, ScaleAction::Up(3))
             .await
             .unwrap();
 
