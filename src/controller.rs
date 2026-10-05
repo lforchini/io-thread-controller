@@ -14,7 +14,6 @@ use std::{
 use futures_util::future::join_all;
 use procfs::{CurrentSI, ProcError};
 use serde::{Deserialize, Serialize};
-use statistical::median;
 use thiserror::Error;
 
 use crate::{
@@ -109,36 +108,6 @@ pub struct SnapshotLatency {
     pub p99: u64,
     /// Histogram-derived arithmetic mean in microseconds.
     pub avg: u64,
-}
-
-/// Average, median, and aggregate utilisation across sampled workers.
-#[derive(Debug, Clone, Copy)]
-struct CpuStats {
-    /// Mean per-worker utilisation in percent.
-    avg_pct: u64,
-    /// Median per-worker utilisation in percent.
-    median_pct: u64,
-    /// Sum of per-worker utilisation percentages.
-    total_pct: u64,
-}
-
-/// Summarise per-worker utilisation, falling back to aggregate samples.
-fn compute_cpu_stats(s: &crate::instance::InstanceStatus) -> CpuStats {
-    if !s.per_worker_util.is_empty() {
-        let total = s.per_worker_util.iter().sum::<f64>();
-        let median = median(&s.per_worker_util);
-        return CpuStats {
-            avg_pct: (total / s.per_worker_util.len() as f64 * 100.0).round() as u64,
-            median_pct: (median * 100.0).round() as u64,
-            total_pct: (total * 100.0).round() as u64,
-        };
-    }
-
-    CpuStats {
-        avg_pct: (s.per_thread_util * 100.0).round() as u64,
-        median_pct: (s.per_thread_util * 100.0).round() as u64,
-        total_pct: (s.per_thread_util * s.thread_count as f64 * 100.0).round() as u64,
-    }
 }
 
 #[derive(Debug, Error)]
@@ -509,7 +478,7 @@ impl Controller {
         for id in ids {
             let instance = &self.instances[id];
             let s = instance.status.read().await;
-            let cpu_stats = compute_cpu_stats(&s);
+            let cpu_stats = s.cpu_stats();
             payload.vms.push(SnapshotVm {
                 id: id.clone(),
                 vcpu_count: s.vcpu_count,
@@ -795,7 +764,7 @@ impl Controller {
         status: &InstanceStatus,
         iops_windows: [Option<u64>; 3],
     ) {
-        let cpu = compute_cpu_stats(status);
+        let cpu = status.cpu_stats();
         tracing::info!(
             target: "status",
             vm = instance.to_string(),
