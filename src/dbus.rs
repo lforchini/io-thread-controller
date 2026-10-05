@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 /// D-Bus well-known bus name the daemon claims at startup.
@@ -57,10 +58,10 @@ pub enum DbusRequest {
         /// Reply channel carrying the serialized snapshot.
         reply: oneshot::Sender<String>,
     },
-    /// [`crate::controller::SnapshotPayload`].
+    /// [`SnapshotPayload`].
     GetSnapshot {
         /// Reply channel; JSON-encoded
-        /// [`crate::controller::SnapshotPayload`] on success.
+        /// [`SnapshotPayload`] on success.
         reply: oneshot::Sender<String>,
     },
     /// Return the controller binary version string.
@@ -109,6 +110,90 @@ pub enum DbusRequest {
         /// Reply channel carrying success or an error message.
         reply: oneshot::Sender<Result<(), String>>,
     },
+}
+
+/// Wire-facing container for the D-Bus `GetSnapshot` reply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotPayload {
+    /// One entry per tracked instance.
+    pub vms: Vec<SnapshotVm>,
+}
+
+/// One tracked instance's freshest state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotVm {
+    /// Instance / vm identifier.
+    pub id: String,
+    /// Guest vCPU count reported by the backend.
+    pub vcpu_count: u32,
+    /// Backend worker PID.
+    pub pid: i32,
+    /// Current effective thread-pool size.
+    pub thread_count: u32,
+    /// Whether the most recent refresh succeeded.
+    pub alive: bool,
+    /// Whether the backend supplied trustworthy performance data.
+    pub perf_available: bool,
+    /// Average utilisation per worker, as a 0..1 fraction.
+    pub per_thread_util: f64,
+    /// Whether a sticky manual override suppresses automatic scaling.
+    pub manual_scaling_sticky: bool,
+    /// Per-tick read operation rate.
+    pub read_iops: u64,
+    /// Per-tick write operation rate.
+    pub write_iops: u64,
+    /// Per-tick non-read/write operation rate.
+    pub other_iops: u64,
+    /// Per-tick read bandwidth in bytes per second.
+    pub read_bw_bps: u64,
+    /// Per-tick write bandwidth in bytes per second.
+    pub write_bw_bps: u64,
+    /// Read-latency histogram digest, when available.
+    #[serde(default)]
+    pub read_latency_us: Option<SnapshotLatency>,
+    /// Write-latency histogram digest, when available.
+    #[serde(default)]
+    pub write_latency_us: Option<SnapshotLatency>,
+    /// Number of queues represented by `per_vq_depth`.
+    #[serde(default)]
+    pub num_queues: Option<u32>,
+    /// One in-flight depth reading per virtqueue.
+    #[serde(default)]
+    pub per_vq_depth: Option<Vec<u64>>,
+    /// Aggregate virtqueue depth.
+    #[serde(default)]
+    pub qd_total: Option<u64>,
+    /// Average virtqueue depth multiplied by 100.
+    #[serde(default)]
+    pub qd_avg_x100: Option<u64>,
+    /// Median virtqueue depth.
+    #[serde(default)]
+    pub qd_median: Option<u64>,
+    /// Mean per-worker CPU utilisation, in percent.
+    #[serde(default)]
+    pub cpu_pct_avg: Option<u64>,
+    /// Median per-worker CPU utilisation, in percent.
+    #[serde(default)]
+    pub cpu_pct_median: Option<u64>,
+    /// Sum of per-worker CPU utilisation, in percent.
+    #[serde(default)]
+    pub cpu_pct_total: Option<u64>,
+}
+
+/// Serialised latency histogram digest.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotLatency {
+    /// Median latency in microseconds.
+    pub p50: u64,
+    /// 95th-percentile latency in microseconds.
+    pub p95: u64,
+    /// 99th-percentile latency in microseconds.
+    pub p99: u64,
+    /// Histogram-derived arithmetic mean in microseconds.
+    pub avg: u64,
 }
 
 /// zbus interface object -- one handle per bus connection.
