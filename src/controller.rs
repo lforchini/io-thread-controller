@@ -552,98 +552,19 @@ impl Controller {
             Some(perf) => perf.total_io_count(),
             None => 0,
         };
-        let sticky = status.manual_scaling_sticky;
-        let scaling_allowed = status.scaling_allowed();
-        let vcpu_count = status.vcpu_count;
-        let cooldown_until = status.cooldown_until;
+        let blocked = self.blocked_reason(&status, action, target, Instant::now());
         drop(status);
 
-        if sticky {
-            self.report_blocked_scale(&instance.id, action, BlockedReason::ManualOverride)
+        if let Some(reason) = blocked {
+            self.report_blocked_scale(&instance.id, action, reason)
                 .await;
             tracing::info!(
                 target: "controller",
                 event = "scale_blocked",
-                reason = "manual_override",
                 vm = %instance.id,
-                action = %action
-            );
-            return Ok(());
-        }
-        if !scaling_allowed {
-            self.report_blocked_scale(&instance.id, action, BlockedReason::UnmanagedVm)
-                .await;
-            tracing::info!(
-                target: "controller",
-                event = "scale_blocked",
-                reason = "unmanaged_vm",
-                vm = %instance.id,
-                action = %action
-            );
-            return Ok(());
-        }
-        if target < self.cfg.min_thread_count {
-            self.report_blocked_scale(instance_id, action, BlockedReason::TargetBelowMinimum)
-                .await;
-            tracing::info!(
-                target: "controller",
-                id = %instance.id,
+                action = %action,
                 target,
-                minimum = self.cfg.min_thread_count,
-                "automatic scaling suppressed by controller minimum"
-            );
-            return Ok(());
-        }
-        if target > self.cfg.max_thread_count {
-            self.report_blocked_scale(instance_id, action, BlockedReason::TargetExceedsMaximum)
-                .await;
-            tracing::info!(
-                target: "controller",
-                id = %instance.id,
-                target,
-                maximum = self.cfg.max_thread_count,
-                "automatic scaling suppressed by controller maximum"
-            );
-            return Ok(());
-        }
-        if target > vcpu_count {
-            self.report_blocked_scale(instance_id, action, BlockedReason::TargetExceedsVcpuCount)
-                .await;
-            tracing::info!(
-                target: "controller",
-                id = %instance.id,
-                target,
-                vcpus = vcpu_count,
-                "automatic scaling suppressed by vCPU cap"
-            );
-            return Ok(());
-        }
-        if action.is_ordinary() && cooldown_until.is_some_and(|until| Instant::now() < until) {
-            self.report_blocked_scale(instance_id, action, BlockedReason::Cooldown)
-                .await;
-            tracing::info!(
-                target: "controller",
-                id = %instance.id,
-                "automatic scaling suppressed by cooldown"
-            );
-            return Ok(());
-        }
-        // FIXME This condition allows ScaleAction::Down(...) with an increasing target
-        // to bypass the ceiling. This check should be removed or Down(...) should be
-        // blocked from having targets greater than the original.
-        if target > previous_count
-            && matches!(action, ScaleAction::Up(_))
-            && self.cfg.host_cpu_scale_up_ceiling > 0.0
-            && self.host_cpu_util >= self.cfg.host_cpu_scale_up_ceiling
-        {
-            self.report_blocked_scale(instance_id, action, BlockedReason::HostCpuCeiling)
-                .await;
-            tracing::info!(
-                target: "controller",
-                id = %instance.id,
-                host_cpu = self.host_cpu_util,
-                ceiling = self.cfg.host_cpu_scale_up_ceiling,
-                "automatic scaling suppressed by host CPU guard"
+                %reason
             );
             return Ok(());
         }
@@ -718,6 +639,45 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// Return the first controller guard that forbids applying `action`.
+    fn blocked_reason(
+        &self,
+        status: &InstanceStatus,
+        action: ScaleAction,
+        target: u32,
+        now: Instant,
+    ) -> Option<BlockedReason> {
+        if status.manual_scaling_sticky {
+            return Some(BlockedReason::ManualOverride);
+        }
+        if !status.scaling_allowed() {
+            return Some(BlockedReason::UnmanagedVm);
+        }
+        if target < self.cfg.min_thread_count {
+            return Some(BlockedReason::TargetBelowMinimum);
+        }
+        if target > self.cfg.max_thread_count {
+            return Some(BlockedReason::TargetExceedsMaximum);
+        }
+        if target > status.vcpu_count {
+            return Some(BlockedReason::TargetExceedsVcpuCount);
+        }
+        if action.is_ordinary() && status.cooldown_until.is_some_and(|until| now < until) {
+            return Some(BlockedReason::Cooldown);
+        }
+        // FIXME This condition allows ScaleAction::Down(...) with an increasing target
+        // to bypass the ceiling. This check should be removed or Down(...) should be
+        // blocked from having targets greater than the original.
+        if target > status.thread_count
+            && matches!(action, ScaleAction::Up(_))
+            && self.cfg.host_cpu_scale_up_ceiling > 0.0
+            && self.host_cpu_util >= self.cfg.host_cpu_scale_up_ceiling
+        {
+            return Some(BlockedReason::HostCpuCeiling);
+        }
+        None
     }
 
     /// Report a controller-blocked action to the proposing engine.
@@ -954,81 +914,126 @@ mod tests {
         assert_eq!(target.load(Ordering::Relaxed), 3);
     }
 
-    // FIXME This test seems like it mixes basic ScaleAction unit tests and more
-    // complex multi-tick behaviour instead of having two tests exercising different
-    // things.
-    /// Test that actuation clamps thread targets to configured min/max
-    /// and blocks scale-up when host CPU is above the ceiling.
-    #[test(tokio::test)]
-    async fn actuation_enforces_controller_bounds_and_host_ceiling() {
+    fn guard_controller() -> (tempfile::TempDir, Controller) {
         let state_dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             vm_state_path: Path::new(&state_dir.path().join("ownership.json")),
             min_thread_count: 2,
-            max_thread_count: 3,
+            max_thread_count: 6,
             host_cpu_scale_up_ceiling: 0.5,
-            cooldown_secs: 30.0,
             ..Default::default()
         };
-        let target = Arc::new(AtomicU32::new(2));
-        let client = VcpuLimitedClient {
-            target: Arc::clone(&target),
-        };
-        let instance = Arc::new(Instance::new(
-            "policy-guarded".to_string(),
-            Path::new(""),
-            0,
-            client,
-        ));
-        {
-            let mut status = instance.status.write().await;
-            status.thread_count = 2;
-            status.vcpu_count = 4;
-        }
-        let mut controller = Controller::new(
+        let controller = Controller::new(
             cfg,
             Box::new(ThresholdEngine::new(ThresholdConfig::default())),
         )
         .unwrap();
-        controller.host_cpu_util = 0.5;
-        controller
-            .instances
-            .insert(instance.id.clone(), Arc::clone(&instance));
+        (state_dir, controller)
+    }
 
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(3))
-            .await
-            .unwrap();
-        assert_eq!(target.load(Ordering::Relaxed), 2);
+    /// A managed, idle VM with 3 of 4 vCPUs' worth of workers.
+    fn guard_status() -> InstanceStatus {
+        InstanceStatus {
+            thread_count: 3,
+            vcpu_count: 4,
+            ownership_classification: Some(true),
+            ..Default::default()
+        }
+    }
 
-        controller.host_cpu_util = 0.0;
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(3))
-            .await
-            .unwrap();
-        assert_eq!(target.load(Ordering::Relaxed), 2);
+    /// Test that each controller guard maps to its `BlockedReason`, in
+    /// priority order.
+    #[test]
+    fn blocked_reason_guards() {
+        type Tweak = fn(&mut InstanceStatus);
+        let in_cooldown: Tweak =
+            |s| s.cooldown_until = Some(Instant::now() + Duration::from_secs(60));
+        let cases: [(&str, Tweak, ScaleAction, f64, Option<BlockedReason>); 11] = [
+            ("allowed", |_| {}, ScaleAction::Up(4), 0.0, None),
+            (
+                "sticky",
+                |s| s.manual_scaling_sticky = true,
+                ScaleAction::Up(4),
+                0.0,
+                Some(BlockedReason::ManualOverride),
+            ),
+            (
+                "unmanaged",
+                |s| s.ownership_classification = Some(false),
+                ScaleAction::Up(4),
+                0.0,
+                Some(BlockedReason::UnmanagedVm),
+            ),
+            (
+                "unclassified",
+                |s| s.ownership_classification = None,
+                ScaleAction::Up(4),
+                0.0,
+                Some(BlockedReason::UnmanagedVm),
+            ),
+            (
+                "below minimum",
+                |_| {},
+                ScaleAction::Down(1),
+                0.0,
+                Some(BlockedReason::TargetBelowMinimum),
+            ),
+            (
+                "above maximum",
+                |s| s.vcpu_count = 16,
+                ScaleAction::Up(7),
+                0.0,
+                Some(BlockedReason::TargetExceedsMaximum),
+            ),
+            (
+                "above vCPUs",
+                |_| {},
+                ScaleAction::Up(5),
+                0.0,
+                Some(BlockedReason::TargetExceedsVcpuCount),
+            ),
+            (
+                "cooldown",
+                in_cooldown,
+                ScaleAction::Down(2),
+                0.0,
+                Some(BlockedReason::Cooldown),
+            ),
+            (
+                "revert ignores cooldown",
+                in_cooldown,
+                ScaleAction::Revert(2),
+                0.0,
+                None,
+            ),
+            (
+                "host CPU ceiling",
+                |_| {},
+                ScaleAction::Up(4),
+                0.5,
+                Some(BlockedReason::HostCpuCeiling),
+            ),
+            (
+                "host CPU allows down",
+                |_| {},
+                ScaleAction::Down(2),
+                0.9,
+                None,
+            ),
+        ];
 
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Down(2))
-            .await
-            .unwrap();
-        assert_eq!(target.load(Ordering::Relaxed), 2);
-
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Revert(2))
-            .await
-            .unwrap();
-        assert_eq!(target.load(Ordering::Relaxed), 2);
-
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Down(1))
-            .await
-            .unwrap();
-        controller
-            .apply_engine_decision(&instance.id, ScaleAction::Up(4))
-            .await
-            .unwrap();
-        assert_eq!(target.load(Ordering::Relaxed), 2);
+        let (_state_dir, mut controller) = guard_controller();
+        for (name, tweak, action, host_cpu_util, expected) in cases {
+            controller.host_cpu_util = host_cpu_util;
+            let mut status = guard_status();
+            tweak(&mut status);
+            let target = action.target().unwrap();
+            assert_eq!(
+                controller.blocked_reason(&status, action, target, Instant::now()),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     struct SnapshotClient {
