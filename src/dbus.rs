@@ -192,7 +192,7 @@ impl Service {
         self.tx
             .send(DbusRequest::GetSnapshot { reply: tx })
             .await
-            .map_err(|_| zbus::fdo::Error::Failed("engine channel closed".into()))?;
+            .map_err(|_| zbus::fdo::Error::Failed("controller channel closed".into()))?;
         await_with_timeout(rx).await
     }
 
