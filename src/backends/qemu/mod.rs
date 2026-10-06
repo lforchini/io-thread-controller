@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     backends::{Backend, BackendClientError, BackendRegistration},
     config::{ConfigError, load_config},
-    instance::{Instance, InstanceClient},
+    instance::Instance,
     util::Path,
 };
 
@@ -202,11 +202,7 @@ impl Backend for QemuBackend {
                 }
             };
             let libvirt_qmp = libvirt::LibvirtQmp::new(uuid, conn.clone());
-            let client: Box<dyn InstanceClient> = Box::new(client::QemuInstanceClient::new(
-                uuid,
-                libvirt_qmp,
-                vcpu_count,
-            ));
+            let client = client::QemuInstanceClient::new(uuid, libvirt_qmp, vcpu_count);
             // `sock_path` is inherited from the generic
             // `Instance` model; for the libvirt-backed backend
             // it is purely informational (log context), so we
